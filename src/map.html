@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Commudus Live Map</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        body { margin: 0; padding: 0; }
+        #map { height: 100vh; width: 100vw; }
+        #info {
+            position: absolute; top: 10px; left: 50px;
+            background: white; padding: 10px; z-index: 1000;
+            border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            font-family: sans-serif;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <strong>Commudus Map</strong><br>
+        Active Users: <span id="user-count">0</span>
+    </div>
+    <div id="map"></div>
+    <script>
+        var map = L.map('map').setView([60.1699, 24.9384], 13);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+
+        var markers = {};
+        var firstLoad = true;
+
+        function updateMap() {
+            fetch('/users')
+                .then(response => response.json())
+                .then(users => {
+                    document.getElementById('user-count').innerText = users.length;
+
+                    const currentIds = new Set(users.map(u => u.user_id));
+
+                    Object.keys(markers).forEach(id => {
+                        if (!currentIds.has(id)) {
+                            map.removeLayer(markers[id]);
+                            delete markers[id];
+                        }
+                    });
+
+                    users.forEach(user => {
+                        if (markers[user.user_id]) {
+                            markers[user.user_id].setLatLng([user.lat, user.lon]);
+                        } else {
+                            markers[user.user_id] = L.marker([user.lat, user.lon])
+                                .addTo(map)
+                                .bindPopup("<b>" + user.username + "</b>");
+                            }
+                        });
+
+                        if (users.length > 0 && firstLoad) {
+                            var group = new L.featureGroup(Object.values(markers));
+                            map.fitBounds(group.getBounds().pad(0.1));
+                            firstLoad = false;
+                        }
+                    })
+                    .catch(err => console.error("Error polling users:", err));
+        }
+
+        setInterval(updateMap, 3000);
+        updateMap();
+    </script>
+</body>
+</html>
