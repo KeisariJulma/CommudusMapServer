@@ -112,7 +112,8 @@ def _init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS groups (
-              id TEXT PRIMARY KEY
+              id TEXT PRIMARY KEY,
+              name TEXT
             );
 
             CREATE TABLE IF NOT EXISTS group_members (
@@ -137,6 +138,13 @@ def _init_db() -> None:
         # Migration: add owner_user_id to groups (SQLite doesn't support IF NOT EXISTS for columns)
         try:
             conn.execute("ALTER TABLE groups ADD COLUMN owner_user_id TEXT")
+        except sqlite3.OperationalError:
+            # column already exists
+            pass
+
+        # Migration: add name to groups (SQLite doesn't support IF NOT EXISTS for columns)
+        try:
+            conn.execute("ALTER TABLE groups ADD COLUMN name TEXT")
         except sqlite3.OperationalError:
             # column already exists
             pass
@@ -183,10 +191,13 @@ class UserLocation(BaseModel):
 
 class GroupCreate(BaseModel):
     id: Optional[str] = None
+    name: Optional[str] = None
 
 
 class GroupPublic(BaseModel):
     id: str
+    name: Optional[str] = None
+    owner_user_id: Optional[str] = None
 
 
 class ShareUpdate(BaseModel):
@@ -241,11 +252,28 @@ def _get_group_owner_id(group_id: str) -> Optional[str]:
             return None
         return row["owner_user_id"]
 
+def _set_group_owner(group_id: str, owner_user_id: str) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE groups SET owner_user_id = ? WHERE id = ? AND (owner_user_id IS NULL OR owner_user_id = '')",
+            (owner_user_id, group_id),
+        )
 
-def _create_group_with_owner(group_id: str, owner_user_id: str) -> GroupPublic:
+
+
+def _create_group_with_owner(group_id: str, owner_user_id: str, name: Optional[str] = None) -> GroupPublic:
     with _get_conn() as conn:
         # create the group if it doesn't exist
-        conn.execute("INSERT OR IGNORE INTO groups(id) VALUES (?)", (group_id,))
+        conn.execute("INSERT OR IGNORE INTO groups(id, name) VALUES (?, ?)", (group_id, name))
+        if name:
+            conn.execute(
+                """
+                UPDATE groups
+                SET name = ?
+                WHERE id = ? AND (name IS NULL OR name = '')
+                """,
+                (name, group_id),
+            )
 
         # if owner isn't set yet, set it (first creator becomes owner)
         conn.execute(
@@ -263,16 +291,33 @@ def _create_group_with_owner(group_id: str, owner_user_id: str) -> GroupPublic:
             (group_id, owner_user_id),
         )
 
-    return GroupPublic(id=group_id)
+        row = conn.execute("SELECT id, name FROM groups WHERE id = ?", (group_id,)).fetchone()
+
+    return GroupPublic(id=row["id"], name=row["name"] if row else name, owner_user_id=owner_user_id)
 
 
-def _create_group(group_id: str) -> GroupPublic:
+def _create_group(group_id: str, name: Optional[str] = None) -> GroupPublic:
     with _get_conn() as conn:
-        conn.execute("INSERT OR IGNORE INTO groups(id) VALUES (?)", (group_id,))
-    return GroupPublic(id=group_id)
+        conn.execute("INSERT OR IGNORE INTO groups(id, name) VALUES (?, ?)", (group_id, name))
+        if name:
+            conn.execute(
+                "UPDATE groups SET name = ? WHERE id = ? AND (name IS NULL OR name = '')",
+                (name, group_id),
+            )
+        row = conn.execute("SELECT id, name FROM groups WHERE id = ?", (group_id,)).fetchone()
+    return GroupPublic(id=row["id"], name=row["name"] if row else name, owner_user_id=owner_user_id)
 
 
-def _list_groups() -> List[str]:
+def _list_groups() -> List[dict]:
+    with _get_conn() as conn:
+        rows = conn.execute("SELECT id, name, owner_user_id FROM groups ORDER BY id").fetchall()
+        return [
+            {"id": r["id"], "name": r["name"], "owner_user_id": r["owner_user_id"]}
+            for r in rows
+        ]
+
+
+def _list_group_ids() -> List[str]:
     with _get_conn() as conn:
         rows = conn.execute("SELECT id FROM groups ORDER BY id").fetchall()
         return [r["id"] for r in rows]
@@ -357,6 +402,15 @@ def _list_members_with_names(group_id: str) -> List[dict]:
         return [{"id": r["id"], "name": r["name"]} for r in rows]
 
 
+def _count_members(group_id: str) -> int:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM group_members WHERE group_id = ?",
+            (group_id,),
+        ).fetchone()
+        return int(row["count"] if row else 0)
+
+
 # -----------------------
 # Routes: Users + Auth
 # -----------------------
@@ -401,7 +455,7 @@ async def login(payload: "LoginRequest"):
 @app.post("/groups", response_model=GroupPublic)
 async def create_group(payload: GroupCreate, current_user_id: str = Depends(get_current_user_id)):
     group_id = payload.id or str(uuid.uuid4())
-    return await _db_call(_create_group_with_owner, group_id, current_user_id)
+    return await _db_call(_create_group_with_owner, group_id, current_user_id, payload.name)
 
 
 @app.get("/groups")
@@ -411,7 +465,7 @@ async def list_groups():
 
 @app.get("/groups/ids")
 async def list_group_ids_get(current_user_id: str = Depends(get_current_user_id)):
-    groups = await _db_call(_list_groups)
+    groups = await _db_call(_list_group_ids)
     return {"groups": groups}
 
 @app.post("/groups/{group_id}/members/{user_id}")
@@ -425,8 +479,16 @@ async def add_user_to_group(
 
     owner_id = await _db_call(_get_group_owner_id, group_id)
     if not owner_id:
+        # legacy group without owner: allow self-join and claim ownership
+        if current_user_id == user_id:
+            await _db_call(_set_group_owner, group_id, current_user_id)
+            await _db_call(_add_member, group_id, user_id)
+            return {"status": "ok", "group_id": group_id, "user_id": user_id}
         raise HTTPException(status_code=404, detail="group not found")
-    if owner_id != current_user_id:
+
+    # allow self-join, owner adds others
+    is_self_join = current_user_id == user_id
+    if not is_self_join and owner_id != current_user_id:
         raise HTTPException(status_code=403, detail="only group owner can add members")
 
     if not await _db_call(_user_exists, user_id):
@@ -448,16 +510,29 @@ async def remove_user_from_group(
     owner_id = await _db_call(_get_group_owner_id, group_id)
     if not owner_id:
         raise HTTPException(status_code=404, detail="group not found")
-    if owner_id != current_user_id:
+
+    # allow self-leave, owner removes others
+    is_self_leave = current_user_id == user_id
+    if not is_self_leave and owner_id != current_user_id:
         raise HTTPException(status_code=403, detail="only group owner can remove members")
 
-    # optional safety: prevent removing the owner
-    if user_id == owner_id:
-        raise HTTPException(status_code=400, detail="cannot remove group owner")
+    # prevent owner leaving if others still exist
+    if is_self_leave and user_id == owner_id:
+        member_count = await _db_call(_count_members, group_id)
+        if member_count > 1:
+            raise HTTPException(status_code=400, detail="owner cannot leave while other members exist")
 
     removed = await _db_call(_remove_member, group_id, user_id)
     if removed == 0:
         raise HTTPException(status_code=404, detail="membership not found")
+
+    # delete group if no members left
+    remaining = await _db_call(_count_members, group_id)
+    if remaining == 0:
+        with _get_conn() as conn:
+            conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+        return {"status": "deleted", "group_id": group_id, "user_id": user_id}
+
     return {"status": "ok", "group_id": group_id, "user_id": user_id}
 
 
