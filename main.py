@@ -453,6 +453,15 @@ def _list_members_with_names(group_id: str) -> List[dict]:
         return [{"id": r["id"], "name": r["name"]} for r in rows]
 
 
+def _is_member(group_id: str, user_id: str) -> bool:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?",
+            (group_id, user_id),
+        ).fetchone()
+        return row is not None
+
+
 def _count_members(group_id: str) -> int:
     with _get_conn() as conn:
         row = conn.execute(
@@ -737,9 +746,15 @@ async def remove_user_from_group(
 
 
 @app.get("/groups/{group_id}/members")
-async def list_group_members(group_id: str, with_names: bool = False):
+async def list_group_members(
+    group_id: str,
+    with_names: bool = False,
+    current_user_id: str = Depends(get_current_user_id),
+):
     if not await _db_call(_group_exists, group_id):
         raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
 
     if with_names:
         members = await _db_call(_list_members_with_names, group_id)
