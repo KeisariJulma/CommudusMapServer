@@ -831,7 +831,7 @@ async def startup_event():
         while True:
             await asyncio.sleep(10)
             now = time.time()
-            removed = [uid for uid, loc in user_store.items() if now - loc.last_seen > 30]
+            removed = [uid for uid, loc in user_store.items() if now - loc.last_seen > 300]
             for uid in removed:
                 user = user_store.pop(uid)
                 print(f"🗑️ Removed inactive user: {user.username} ({uid})")
