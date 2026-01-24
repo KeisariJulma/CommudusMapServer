@@ -14,6 +14,8 @@ import os
 import base64
 import hashlib
 import hmac
+import json
+import urllib.request
 
 from jose import jwt, JWTError
 
@@ -141,6 +143,14 @@ def _init_db() -> None:
               FOREIGN KEY (user_id)  REFERENCES users(id)  ON DELETE CASCADE,
               FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS user_push_tokens (
+              user_id TEXT NOT NULL,
+              token TEXT NOT NULL,
+              created_at REAL NOT NULL,
+              PRIMARY KEY (user_id, token),
+              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
             """
         )
 
@@ -211,6 +221,10 @@ class GroupPublic(BaseModel):
 
 class ShareUpdate(BaseModel):
     enabled: bool
+
+
+class PushTokenPayload(BaseModel):
+    token: str
 
 
 # -----------------------
@@ -387,6 +401,33 @@ def _get_share_enabled_member_ids(group_id: str) -> List[str]:
         ).fetchall()
         return [r["user_id"] for r in rows]
 
+
+def _add_push_token(user_id: str, token: str) -> None:
+    with _get_conn() as conn:
+        now = time.time()
+        conn.execute(
+            "INSERT OR IGNORE INTO user_push_tokens(user_id, token, created_at) VALUES (?, ?, ?)",
+            (user_id, token, now),
+        )
+
+
+def _list_push_tokens(user_id: str) -> List[str]:
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT token FROM user_push_tokens WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        ).fetchall()
+        return [r["token"] for r in rows]
+
+
+def _remove_push_token(user_id: str, token: str) -> int:
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM user_push_tokens WHERE user_id = ? AND token = ?",
+            (user_id, token),
+        )
+        return cur.rowcount
+
 def _list_members(group_id: str) -> List[str]:
     with _get_conn() as conn:
         rows = conn.execute(
@@ -456,6 +497,31 @@ def _remove_join_request(group_id: str, user_id: str) -> int:
         return cur.rowcount
 
 
+def _send_expo_push(tokens: List[str], title: str, body: str, data: dict) -> None:
+    if not tokens:
+        return
+    messages = [
+        {"to": token, "title": title, "body": body, "data": data, "sound": "default"}
+        for token in tokens
+    ]
+    payload = json.dumps(messages).encode("utf-8")
+    req = urllib.request.Request(
+        "https://exp.host/--/api/v2/push/send",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as response:
+        response.read()
+
+
+async def _send_expo_push_async(tokens: List[str], title: str, body: str, data: dict) -> None:
+    try:
+        await asyncio.to_thread(_send_expo_push, tokens, title, body, data)
+    except Exception as exc:
+        print("Failed to send Expo push:", exc)
+
+
 # -----------------------
 # Routes: Users + Auth
 # -----------------------
@@ -473,6 +539,20 @@ async def get_user_by_email(email: EmailStr, current_user_id: str = Depends(get_
     if not row:
         raise HTTPException(status_code=404, detail="user not found")
     return {"id": row["id"], "name": row["name"], "email": row["email"]}
+
+
+@app.post("/users/{user_id}/push-token")
+async def register_push_token(
+    user_id: str,
+    payload: PushTokenPayload,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if current_user_id != user_id:
+        raise HTTPException(status_code=403, detail="cannot register token for another user")
+    if not payload.token:
+        raise HTTPException(status_code=400, detail="token required")
+    await _db_call(_add_push_token, user_id, payload.token)
+    return {"status": "ok"}
 
 
 @app.post("/users", response_model=UserPublic)
@@ -525,6 +605,16 @@ async def request_to_join_group(
     if current_user_id in members:
         return {"status": "already_member", "group_id": group_id, "user_id": current_user_id}
     await _db_call(_create_join_request, group_id, current_user_id)
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if owner_id and owner_id != current_user_id:
+        tokens = await _db_call(_list_push_tokens, owner_id)
+        if tokens:
+            requester = await _db_call(_get_user_by_id, current_user_id)
+            requester_name = requester["name"] if requester else "Uusi käyttäjä"
+            title = "Liittymispyyntö"
+            body = f"{requester_name} haluaa liittyä ryhmään {group_id}."
+            data = {"group_id": group_id, "user_id": current_user_id}
+            asyncio.create_task(_send_expo_push_async(tokens, title, body, data))
     return {"status": "requested", "group_id": group_id, "user_id": current_user_id}
 
 
