@@ -205,6 +205,7 @@ class UserLocation(BaseModel):
     username: str
     lat: float
     lon: float
+    heading: Optional[float] = None
     last_seen: float = 0.0
 
 
