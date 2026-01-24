@@ -124,6 +124,15 @@ def _init_db() -> None:
               FOREIGN KEY (user_id)  REFERENCES users(id)  ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS group_join_requests (
+              group_id TEXT NOT NULL,
+              user_id  TEXT NOT NULL,
+              created_at REAL NOT NULL,
+              PRIMARY KEY (group_id, user_id),
+              FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+              FOREIGN KEY (user_id)  REFERENCES users(id)  ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS user_group_sharing (
               user_id  TEXT NOT NULL,
               group_id TEXT NOT NULL,
@@ -411,6 +420,42 @@ def _count_members(group_id: str) -> int:
         return int(row["count"] if row else 0)
 
 
+def _create_join_request(group_id: str, user_id: str) -> None:
+    with _get_conn() as conn:
+        now = time.time()
+        conn.execute(
+            "INSERT OR IGNORE INTO group_join_requests(group_id, user_id, created_at) VALUES (?, ?, ?)",
+            (group_id, user_id, now),
+        )
+
+
+def _list_join_requests_with_names(group_id: str) -> List[dict]:
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT u.id AS id, u.name AS name, r.created_at AS created_at
+            FROM group_join_requests r
+            JOIN users u ON u.id = r.user_id
+            WHERE r.group_id = ?
+            ORDER BY r.created_at ASC
+            """,
+            (group_id,),
+        ).fetchall()
+        return [
+            {"id": r["id"], "name": r["name"], "created_at": r["created_at"]}
+            for r in rows
+        ]
+
+
+def _remove_join_request(group_id: str, user_id: str) -> int:
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM group_join_requests WHERE group_id = ? AND user_id = ?",
+            (group_id, user_id),
+        )
+        return cur.rowcount
+
+
 # -----------------------
 # Routes: Users + Auth
 # -----------------------
@@ -467,6 +512,70 @@ async def list_groups():
 async def list_group_ids_get(current_user_id: str = Depends(get_current_user_id)):
     groups = await _db_call(_list_group_ids)
     return {"groups": groups}
+
+@app.post("/groups/{group_id}/requests")
+async def request_to_join_group(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    # prevent duplicate membership
+    members = await _db_call(_list_members, group_id)
+    if current_user_id in members:
+        return {"status": "already_member", "group_id": group_id, "user_id": current_user_id}
+    await _db_call(_create_join_request, group_id, current_user_id)
+    return {"status": "requested", "group_id": group_id, "user_id": current_user_id}
+
+
+@app.get("/groups/{group_id}/requests")
+async def list_join_requests(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if not owner_id:
+        raise HTTPException(status_code=404, detail="group not found")
+    if owner_id != current_user_id:
+        raise HTTPException(status_code=403, detail="only group owner can view requests")
+    requests = await _db_call(_list_join_requests_with_names, group_id)
+    return {"group_id": group_id, "requests": requests}
+
+
+@app.post("/groups/{group_id}/requests/{user_id}/approve")
+async def approve_join_request(
+    group_id: str,
+    user_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if not owner_id:
+        raise HTTPException(status_code=404, detail="group not found")
+    if owner_id != current_user_id:
+        raise HTTPException(status_code=403, detail="only group owner can approve requests")
+    if not await _db_call(_user_exists, user_id):
+        raise HTTPException(status_code=404, detail="user not found")
+    await _db_call(_add_member, group_id, user_id)
+    await _db_call(_remove_join_request, group_id, user_id)
+    return {"status": "approved", "group_id": group_id, "user_id": user_id}
+
+
+@app.delete("/groups/{group_id}/requests/{user_id}")
+async def reject_join_request(
+    group_id: str,
+    user_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if not owner_id:
+        raise HTTPException(status_code=404, detail="group not found")
+    if owner_id != current_user_id:
+        raise HTTPException(status_code=403, detail="only group owner can reject requests")
+    removed = await _db_call(_remove_join_request, group_id, user_id)
+    if removed == 0:
+        raise HTTPException(status_code=404, detail="request not found")
+    return {"status": "rejected", "group_id": group_id, "user_id": user_id}
+
 
 @app.post("/groups/{group_id}/members/{user_id}")
 async def add_user_to_group(
