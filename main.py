@@ -151,6 +151,16 @@ def _init_db() -> None:
               PRIMARY KEY (user_id, token),
               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS group_messages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              group_id TEXT NOT NULL,
+              user_id TEXT NOT NULL,
+              body TEXT NOT NULL,
+              created_at REAL NOT NULL,
+              FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
             """
         )
 
@@ -171,6 +181,14 @@ def _init_db() -> None:
         # Optional: index for owner lookups
         try:
             conn.execute("CREATE INDEX idx_groups_owner ON groups(owner_user_id)")
+        except sqlite3.OperationalError:
+            # index already exists
+            pass
+
+        try:
+            conn.execute(
+                "CREATE INDEX idx_group_messages_group_created ON group_messages(group_id, created_at)"
+            )
         except sqlite3.OperationalError:
             # index already exists
             pass
@@ -226,6 +244,19 @@ class ShareUpdate(BaseModel):
 
 class PushTokenPayload(BaseModel):
     token: str
+
+
+class ChatMessageCreate(BaseModel):
+    body: str
+
+
+class ChatMessagePublic(BaseModel):
+    id: int
+    group_id: str
+    user_id: str
+    username: str
+    body: str
+    created_at: float
 
 
 # -----------------------
@@ -498,6 +529,79 @@ def _list_join_requests_with_names(group_id: str) -> List[dict]:
         ]
 
 
+def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float] = None) -> List[dict]:
+    with _get_conn() as conn:
+        if before is None:
+            rows = conn.execute(
+                """
+                SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.created_at
+                FROM group_messages gm
+                JOIN users u ON u.id = gm.user_id
+                WHERE gm.group_id = ?
+                ORDER BY gm.created_at DESC
+                LIMIT ?
+                """,
+                (group_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.created_at
+                FROM group_messages gm
+                JOIN users u ON u.id = gm.user_id
+                WHERE gm.group_id = ? AND gm.created_at < ?
+                ORDER BY gm.created_at DESC
+                LIMIT ?
+                """,
+                (group_id, before, limit),
+            ).fetchall()
+        messages = [
+            {
+                "id": r["id"],
+                "group_id": r["group_id"],
+                "user_id": r["user_id"],
+                "username": r["username"],
+                "body": r["body"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+        return list(reversed(messages))
+
+
+def _add_group_message(group_id: str, user_id: str, body: str) -> dict:
+    created_at = time.time()
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO group_messages(group_id, user_id, body, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (group_id, user_id, body, created_at),
+        )
+        row = conn.execute(
+            """
+            SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.created_at
+            FROM group_messages gm
+            JOIN users u ON u.id = gm.user_id
+            WHERE gm.group_id = ? AND gm.user_id = ? AND gm.created_at = ?
+            ORDER BY gm.id DESC
+            LIMIT 1
+            """,
+            (group_id, user_id, created_at),
+        ).fetchone()
+        if not row:
+            raise RuntimeError("message_insert_failed")
+        return {
+            "id": row["id"],
+            "group_id": row["group_id"],
+            "user_id": row["user_id"],
+            "username": row["username"],
+            "body": row["body"],
+            "created_at": row["created_at"],
+        }
+
+
 def _remove_join_request(group_id: str, user_id: str) -> int:
     with _get_conn() as conn:
         cur = conn.execute(
@@ -762,6 +866,39 @@ async def list_group_members(
 
     members = await _db_call(_list_members, group_id)
     return {"group_id": group_id, "members": members}
+
+
+@app.get("/groups/{group_id}/messages", response_model=List[ChatMessagePublic])
+async def list_group_messages(
+    group_id: str,
+    limit: int = 50,
+    before: Optional[float] = None,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+    limit = max(1, min(200, limit))
+    messages = await _db_call(_list_group_messages, group_id, limit, before)
+    return messages
+
+
+@app.post("/groups/{group_id}/messages", response_model=ChatMessagePublic)
+async def create_group_message(
+    group_id: str,
+    payload: ChatMessageCreate,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+    body = payload.body.strip()
+    if not body:
+        raise HTTPException(status_code=400, detail="message body required")
+    message = await _db_call(_add_group_message, group_id, current_user_id, body)
+    return message
 
 
 @app.put("/users/{user_id}/sharing/groups/{group_id}")
