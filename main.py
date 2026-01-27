@@ -25,6 +25,7 @@ DB_PATH = "app.db"
 JWT_SECRET = os.environ.get("JWT_SECRET")  # set this in your shell
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRES_SECONDS = 60 * 60 * 24 * 7  # 7 days
+FCM_SERVER_KEY = os.environ.get("FCM_SERVER_KEY")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
@@ -636,6 +637,37 @@ async def _send_expo_push_async(tokens: List[str], title: str, body: str, data: 
         print("Failed to send Expo push:", exc)
 
 
+def _send_fcm_push(tokens: List[str], title: str, body: str, data: dict) -> None:
+    if not tokens or not FCM_SERVER_KEY:
+        return
+    payload = json.dumps(
+        {
+            "registration_ids": tokens,
+            "notification": {"title": title, "body": body},
+            "data": data,
+            "priority": "high",
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        "https://fcm.googleapis.com/fcm/send",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"key={FCM_SERVER_KEY}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as response:
+        response.read()
+
+
+async def _send_fcm_push_async(tokens: List[str], title: str, body: str, data: dict) -> None:
+    try:
+        await asyncio.to_thread(_send_fcm_push, tokens, title, body, data)
+    except Exception as exc:
+        print("Failed to send FCM push:", exc)
+
+
 # -----------------------
 # Routes: Users + Auth
 # -----------------------
@@ -898,6 +930,23 @@ async def create_group_message(
     if not body:
         raise HTTPException(status_code=400, detail="message body required")
     message = await _db_call(_add_group_message, group_id, current_user_id, body)
+    if FCM_SERVER_KEY:
+        member_ids = await _db_call(_list_members, group_id)
+        target_ids = [uid for uid in member_ids if uid != current_user_id]
+        tokens: List[str] = []
+        for uid in target_ids:
+            tokens.extend(await _db_call(_list_push_tokens, uid))
+        if tokens:
+            deduped = list(dict.fromkeys(tokens))
+            title = message["username"]
+            body_preview = message["body"][:160]
+            data = {
+                "group_id": group_id,
+                "sender_id": current_user_id,
+                "message_id": str(message["id"]),
+                "body": message["body"],
+            }
+            asyncio.create_task(_send_fcm_push_async(deduped, title, body_preview, data))
     return message
 
 
