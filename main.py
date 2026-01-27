@@ -781,10 +781,18 @@ async def request_to_join_group(
         if tokens:
             requester = await _db_call(_get_user_by_id, current_user_id)
             requester_name = requester["name"] if requester else "Uusi käyttäjä"
+            group_name = await _db_call(_get_group_name, group_id)
+            group_label = group_name or group_id
             title = "Liittymispyyntö"
-            body = f"{requester_name} haluaa liittyä ryhmään {group_id}."
-            data = {"group_id": group_id, "user_id": current_user_id}
-            asyncio.create_task(_send_expo_push_async(tokens, title, body, data))
+            body = f"{requester_name} haluaa liittyä ryhmään {group_label}."
+            data = {
+                "type": "join_request",
+                "group_id": group_id,
+                "group_name": group_name or "",
+                "requester_id": current_user_id,
+                "requester_name": requester_name,
+            }
+            asyncio.create_task(_send_fcm_push_async(tokens, title, body, data))
     return {"status": "requested", "group_id": group_id, "user_id": current_user_id}
 
 
