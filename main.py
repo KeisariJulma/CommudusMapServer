@@ -444,6 +444,7 @@ def _get_share_enabled_member_ids(group_id: str) -> List[str]:
 def _add_push_token(user_id: str, token: str) -> None:
     with _get_conn() as conn:
         now = time.time()
+        conn.execute("DELETE FROM user_push_tokens WHERE user_id = ?", (user_id,))
         conn.execute(
             "INSERT OR IGNORE INTO user_push_tokens(user_id, token, created_at) VALUES (?, ?, ?)",
             (user_id, token, now),
@@ -668,8 +669,8 @@ def _send_fcm_push(tokens: List[str], title: str, body: str, data: dict) -> None
         try:
             message = firebase_messaging.Message(
                 token=token,
-                notification=firebase_messaging.Notification(title=title, body=body),
                 data=payload_data,
+                android=firebase_messaging.AndroidConfig(priority="high"),
             )
             firebase_messaging.send(message)
         except Exception as exc:
@@ -951,17 +952,21 @@ async def create_group_message(
         tokens: List[str] = []
         for uid in target_ids:
             tokens.extend(await _db_call(_list_push_tokens, uid))
-        if tokens:
-            deduped = list(dict.fromkeys(tokens))
-            title = message["username"]
-            body_preview = message["body"][:160]
+            if tokens:
+                deduped = list(dict.fromkeys(tokens))
+            body_preview = message["body"][:80]
             data = {
+                "type": "chat",
                 "group_id": group_id,
                 "sender_id": current_user_id,
+                "sender_name": message["username"],
                 "message_id": str(message["id"]),
+                "body_preview": body_preview,
                 "body": message["body"],
             }
-            asyncio.create_task(_send_fcm_push_async(deduped, title, body_preview, data))
+            asyncio.create_task(
+                _send_fcm_push_async(deduped, message["username"], body_preview, data)
+            )
     return message
 
 
