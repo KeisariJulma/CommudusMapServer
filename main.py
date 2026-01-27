@@ -168,6 +168,16 @@ def _init_db() -> None:
               FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS group_message_receipts (
+              message_id INTEGER NOT NULL,
+              user_id TEXT NOT NULL,
+              delivered_at REAL NOT NULL,
+              read_at REAL,
+              PRIMARY KEY (message_id, user_id),
+              FOREIGN KEY (message_id) REFERENCES group_messages(id) ON DELETE CASCADE,
+              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
             """
         )
 
@@ -195,6 +205,22 @@ def _init_db() -> None:
         try:
             conn.execute(
                 "CREATE INDEX idx_group_messages_group_created ON group_messages(group_id, created_at)"
+            )
+        except sqlite3.OperationalError:
+            # index already exists
+            pass
+
+        try:
+            conn.execute(
+                "CREATE INDEX idx_group_message_receipts_user ON group_message_receipts(user_id)"
+            )
+        except sqlite3.OperationalError:
+            # index already exists
+            pass
+
+        try:
+            conn.execute(
+                "CREATE INDEX idx_group_message_receipts_message ON group_message_receipts(message_id)"
             )
         except sqlite3.OperationalError:
             # index already exists
@@ -264,6 +290,9 @@ class ChatMessagePublic(BaseModel):
     username: str
     body: str
     created_at: float
+    delivered_count: int = 0
+    read_count: int = 0
+    recipient_count: int = 0
 
 
 # -----------------------
@@ -583,6 +612,77 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
             for r in rows
         ]
         return list(reversed(messages))
+
+
+def _count_group_members(group_id: str) -> int:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM group_members WHERE group_id = ?",
+            (group_id,),
+        ).fetchone()
+        return int(row["cnt"] if row else 0)
+
+
+def _mark_messages_delivered(group_id: str, user_id: str, message_ids: List[int]) -> None:
+    if not message_ids:
+        return
+    now = time.time()
+    with _get_conn() as conn:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO group_message_receipts(message_id, user_id, delivered_at)
+            VALUES (?, ?, ?)
+            """,
+            [(message_id, user_id, now) for message_id in message_ids],
+        )
+
+
+def _mark_messages_read(group_id: str, user_id: str, message_ids: List[int]) -> None:
+    if not message_ids:
+        return
+    now = time.time()
+    with _get_conn() as conn:
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO group_message_receipts(message_id, user_id, delivered_at, read_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            [(message_id, user_id, now, now) for message_id in message_ids],
+        )
+        placeholders = ",".join("?" for _ in message_ids)
+        conn.execute(
+            f"""
+            UPDATE group_message_receipts
+            SET read_at = ?
+            WHERE user_id = ? AND message_id IN ({placeholders}) AND read_at IS NULL
+            """,
+            [now, user_id, *message_ids],
+        )
+
+
+def _get_receipt_counts(message_ids: List[int]) -> Dict[int, Dict[str, int]]:
+    if not message_ids:
+        return {}
+    placeholders = ",".join("?" for _ in message_ids)
+    with _get_conn() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT message_id,
+                   COUNT(*) AS delivered_count,
+                   SUM(CASE WHEN read_at IS NOT NULL THEN 1 ELSE 0 END) AS read_count
+            FROM group_message_receipts
+            WHERE message_id IN ({placeholders})
+            GROUP BY message_id
+            """,
+            message_ids,
+        ).fetchall()
+        result: Dict[int, Dict[str, int]] = {}
+        for row in rows:
+            result[int(row["message_id"])] = {
+                "delivered_count": int(row["delivered_count"] or 0),
+                "read_count": int(row["read_count"] or 0),
+            }
+        return result
 
 
 def _add_group_message(group_id: str, user_id: str, body: str) -> dict:
@@ -937,6 +1037,7 @@ async def list_group_messages(
     group_id: str,
     limit: int = 50,
     before: Optional[float] = None,
+    mark_read: bool = False,
     current_user_id: str = Depends(get_current_user_id),
 ):
     if not await _db_call(_group_exists, group_id):
@@ -945,7 +1046,34 @@ async def list_group_messages(
         raise HTTPException(status_code=403, detail="not a member of this group")
     limit = max(1, min(200, limit))
     messages = await _db_call(_list_group_messages, group_id, limit, before)
-    return messages
+    if not messages:
+        return messages
+    message_ids = [int(message["id"]) for message in messages]
+    recipient_ids = [
+        int(message["id"])
+        for message in messages
+        if message.get("user_id") != current_user_id
+    ]
+    if recipient_ids:
+        await _db_call(_mark_messages_delivered, group_id, current_user_id, recipient_ids)
+        if mark_read:
+            await _db_call(_mark_messages_read, group_id, current_user_id, recipient_ids)
+    receipt_counts = await _db_call(_get_receipt_counts, message_ids)
+    member_count = await _db_call(_count_group_members, group_id)
+    recipient_count = max(0, member_count - 1)
+    enriched = []
+    for message in messages:
+        msg_id = int(message["id"])
+        counts = receipt_counts.get(msg_id, {"delivered_count": 0, "read_count": 0})
+        enriched.append(
+            {
+                **message,
+                "delivered_count": counts["delivered_count"],
+                "read_count": counts["read_count"],
+                "recipient_count": recipient_count,
+            }
+        )
+    return enriched
 
 
 @app.post("/groups/{group_id}/messages", response_model=ChatMessagePublic)
@@ -962,6 +1090,8 @@ async def create_group_message(
     if not body:
         raise HTTPException(status_code=400, detail="message body required")
     message = await _db_call(_add_group_message, group_id, current_user_id, body)
+    member_count = await _db_call(_count_group_members, group_id)
+    recipient_count = max(0, member_count - 1)
     if FCM_SERVICE_ACCOUNT_FILE:
         member_ids = await _db_call(_list_members, group_id)
         target_ids = [uid for uid in member_ids if uid != current_user_id]
@@ -985,7 +1115,12 @@ async def create_group_message(
             asyncio.create_task(
                 _send_fcm_push_async(deduped, message["username"], body_preview, data)
             )
-    return message
+    return {
+        **message,
+        "delivered_count": 0,
+        "read_count": 0,
+        "recipient_count": recipient_count,
+    }
 
 
 @app.put("/users/{user_id}/sharing/groups/{group_id}")
