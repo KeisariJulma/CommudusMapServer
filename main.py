@@ -298,6 +298,7 @@ class ChatMessagePublic(BaseModel):
 class MessageReceiptUser(BaseModel):
     id: str
     name: str
+    read_at: Optional[float] = None
 
 
 class MessageReceiptSummary(BaseModel):
@@ -721,6 +722,24 @@ def _list_message_read_ids(message_id: int) -> List[str]:
         return [r["user_id"] for r in rows]
 
 
+def _list_message_read_users(message_id: int) -> List[dict]:
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT u.id AS id, u.name AS name, r.read_at AS read_at
+            FROM group_message_receipts r
+            JOIN users u ON u.id = r.user_id
+            WHERE r.message_id = ? AND r.read_at IS NOT NULL
+            ORDER BY r.read_at ASC
+            """,
+            (message_id,),
+        ).fetchall()
+        return [
+            {"id": r["id"], "name": r["name"], "read_at": r["read_at"]}
+            for r in rows
+        ]
+
+
 def _add_group_message(group_id: str, user_id: str, body: str) -> dict:
     created_at = time.time()
     with _get_conn() as conn:
@@ -1128,12 +1147,9 @@ async def get_message_receipts(
     if info["user_id"] != current_user_id:
         raise HTTPException(status_code=403, detail="only sender can view receipts")
     members = await _db_call(_list_members_with_names, group_id)
-    read_ids = set(await _db_call(_list_message_read_ids, message_id))
-    read_by = [
-        member
-        for member in members
-        if member["id"] != current_user_id and member["id"] in read_ids
-    ]
+    read_users = await _db_call(_list_message_read_users, message_id)
+    read_ids = {user["id"] for user in read_users}
+    read_by = [user for user in read_users if user["id"] != current_user_id]
     unread_by = [
         member
         for member in members
