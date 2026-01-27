@@ -295,6 +295,18 @@ class ChatMessagePublic(BaseModel):
     recipient_count: int = 0
 
 
+class MessageReceiptUser(BaseModel):
+    id: str
+    name: str
+
+
+class MessageReceiptSummary(BaseModel):
+    group_id: str
+    message_id: int
+    read_by: List[MessageReceiptUser]
+    unread_by: List[MessageReceiptUser]
+
+
 # -----------------------
 # User CRUD
 # -----------------------
@@ -614,6 +626,17 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
         return list(reversed(messages))
 
 
+def _get_message_info(message_id: int) -> Optional[dict]:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, group_id, user_id FROM group_messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {"id": row["id"], "group_id": row["group_id"], "user_id": row["user_id"]}
+
+
 def _count_group_members(group_id: str) -> int:
     with _get_conn() as conn:
         row = conn.execute(
@@ -683,6 +706,19 @@ def _get_receipt_counts(message_ids: List[int]) -> Dict[int, Dict[str, int]]:
                 "read_count": int(row["read_count"] or 0),
             }
         return result
+
+
+def _list_message_read_ids(message_id: int) -> List[str]:
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id
+            FROM group_message_receipts
+            WHERE message_id = ? AND read_at IS NOT NULL
+            """,
+            (message_id,),
+        ).fetchall()
+        return [r["user_id"] for r in rows]
 
 
 def _add_group_message(group_id: str, user_id: str, body: str) -> dict:
@@ -1074,6 +1110,41 @@ async def list_group_messages(
             }
         )
     return enriched
+
+
+@app.get("/groups/{group_id}/messages/{message_id}/receipts", response_model=MessageReceiptSummary)
+async def get_message_receipts(
+    group_id: str,
+    message_id: int,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+    info = await _db_call(_get_message_info, message_id)
+    if not info or info["group_id"] != group_id:
+        raise HTTPException(status_code=404, detail="message not found")
+    if info["user_id"] != current_user_id:
+        raise HTTPException(status_code=403, detail="only sender can view receipts")
+    members = await _db_call(_list_members_with_names, group_id)
+    read_ids = set(await _db_call(_list_message_read_ids, message_id))
+    read_by = [
+        member
+        for member in members
+        if member["id"] != current_user_id and member["id"] in read_ids
+    ]
+    unread_by = [
+        member
+        for member in members
+        if member["id"] != current_user_id and member["id"] not in read_ids
+    ]
+    return {
+        "group_id": group_id,
+        "message_id": message_id,
+        "read_by": read_by,
+        "unread_by": unread_by,
+    }
 
 
 @app.post("/groups/{group_id}/messages", response_model=ChatMessagePublic)
