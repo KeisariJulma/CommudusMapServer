@@ -18,6 +18,9 @@ import json
 import urllib.request
 
 from jose import jwt, JWTError
+import firebase_admin
+from firebase_admin import credentials as firebase_credentials
+from firebase_admin import messaging as firebase_messaging
 
 app = FastAPI()
 DB_PATH = "app.db"
@@ -25,7 +28,10 @@ DB_PATH = "app.db"
 JWT_SECRET = os.environ.get("JWT_SECRET")  # set this in your shell
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRES_SECONDS = 60 * 60 * 24 * 7  # 7 days
-FCM_SERVER_KEY = os.environ.get("FCM_SERVER_KEY")
+FCM_SERVICE_ACCOUNT_FILE = os.environ.get("FCM_SERVICE_ACCOUNT_FILE") or os.environ.get(
+    "GOOGLE_APPLICATION_CREDENTIALS"
+)
+_fcm_app = None
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
@@ -637,28 +643,37 @@ async def _send_expo_push_async(tokens: List[str], title: str, body: str, data: 
         print("Failed to send Expo push:", exc)
 
 
+def _ensure_fcm_app() -> bool:
+    global _fcm_app
+    if _fcm_app is not None:
+        return True
+    if not FCM_SERVICE_ACCOUNT_FILE:
+        return False
+    try:
+        cred = firebase_credentials.Certificate(FCM_SERVICE_ACCOUNT_FILE)
+        _fcm_app = firebase_admin.initialize_app(cred)
+        return True
+    except Exception as exc:
+        print("Failed to init Firebase Admin SDK:", exc)
+        return False
+
+
 def _send_fcm_push(tokens: List[str], title: str, body: str, data: dict) -> None:
-    if not tokens or not FCM_SERVER_KEY:
+    if not tokens:
         return
-    payload = json.dumps(
-        {
-            "registration_ids": tokens,
-            "notification": {"title": title, "body": body},
-            "data": data,
-            "priority": "high",
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        "https://fcm.googleapis.com/fcm/send",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"key={FCM_SERVER_KEY}",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=10) as response:
-        response.read()
+    if not _ensure_fcm_app():
+        return
+    payload_data = {str(k): str(v) for k, v in data.items()}
+    for token in tokens:
+        try:
+            message = firebase_messaging.Message(
+                token=token,
+                notification=firebase_messaging.Notification(title=title, body=body),
+                data=payload_data,
+            )
+            firebase_messaging.send(message)
+        except Exception as exc:
+            print("FCM send failed", exc)
 
 
 async def _send_fcm_push_async(tokens: List[str], title: str, body: str, data: dict) -> None:
@@ -930,7 +945,7 @@ async def create_group_message(
     if not body:
         raise HTTPException(status_code=400, detail="message body required")
     message = await _db_call(_add_group_message, group_id, current_user_id, body)
-    if FCM_SERVER_KEY:
+    if FCM_SERVICE_ACCOUNT_FILE:
         member_ids = await _db_call(_list_members, group_id)
         target_ids = [uid for uid in member_ids if uid != current_user_id]
         tokens: List[str] = []

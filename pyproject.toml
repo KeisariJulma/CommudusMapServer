@@ -12,6 +12,7 @@ uvicorn = "^0.40.0"
 email-validator = "^2.3.0"
 python-jose = "^3.5.0"
 python-multipart = "^0.0.20"
+firebase-admin = "^6.5.0"
 
 [build-system]
 requires = ["poetry-core"]
