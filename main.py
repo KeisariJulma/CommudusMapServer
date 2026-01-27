@@ -314,6 +314,14 @@ def _get_group_owner_id(group_id: str) -> Optional[str]:
             return None
         return row["owner_user_id"]
 
+
+def _get_group_name(group_id: str) -> Optional[str]:
+    with _get_conn() as conn:
+        row = conn.execute("SELECT name FROM groups WHERE id = ?", (group_id,)).fetchone()
+        if not row:
+            return None
+        return row["name"]
+
 def _set_group_owner(group_id: str, owner_user_id: str) -> None:
     with _get_conn() as conn:
         conn.execute(
@@ -952,12 +960,14 @@ async def create_group_message(
         tokens: List[str] = []
         for uid in target_ids:
             tokens.extend(await _db_call(_list_push_tokens, uid))
-            if tokens:
-                deduped = list(dict.fromkeys(tokens))
+        if tokens:
+            deduped = list(dict.fromkeys(tokens))
             body_preview = message["body"][:80]
+            group_name = await _db_call(_get_group_name, group_id)
             data = {
                 "type": "chat",
                 "group_id": group_id,
+                "group_name": group_name or "",
                 "sender_id": current_user_id,
                 "sender_name": message["username"],
                 "message_id": str(message["id"]),
