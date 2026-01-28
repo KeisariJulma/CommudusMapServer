@@ -284,6 +284,8 @@ def _init_db() -> None:
             # index already exists
             pass
 
+        _purge_empty_groups()
+
 
 def _build_image_url(image_path: Optional[str]) -> Optional[str]:
     if not image_path:
@@ -736,6 +738,48 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
         return list(reversed(messages))
 
 
+def _list_group_message_image_paths(group_id: str) -> List[str]:
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT image_path
+            FROM group_messages
+            WHERE group_id = ? AND image_path IS NOT NULL
+            """,
+            (group_id,),
+        ).fetchall()
+        return [r["image_path"] for r in rows if r["image_path"]]
+
+
+def _delete_group_uploads(group_id: str) -> None:
+    image_paths = _list_group_message_image_paths(group_id)
+    for image_path in image_paths:
+        try:
+            (UPLOAD_DIR / image_path).unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            print("Failed to delete upload", image_path, exc)
+
+
+def _purge_empty_groups() -> None:
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT g.id AS id
+            FROM groups g
+            LEFT JOIN group_members gm ON gm.group_id = g.id
+            GROUP BY g.id
+            HAVING COUNT(gm.user_id) = 0
+            """
+        ).fetchall()
+        empty_ids = [row["id"] for row in rows]
+    for group_id in empty_ids:
+        _delete_group_uploads(group_id)
+        with _get_conn() as conn:
+            conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+
+
 def _get_message_info(message_id: int) -> Optional[dict]:
     with _get_conn() as conn:
         row = conn.execute(
@@ -1171,6 +1215,7 @@ async def remove_user_from_group(
     # delete group if no members left
     remaining = await _db_call(_count_members, group_id)
     if remaining == 0:
+        await _db_call(_delete_group_uploads, group_id)
         with _get_conn() as conn:
             conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
         return {"status": "deleted", "group_id": group_id, "user_id": user_id}
