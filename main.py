@@ -1223,6 +1223,24 @@ async def remove_user_from_group(
     return {"status": "ok", "group_id": group_id, "user_id": user_id}
 
 
+@app.delete("/groups/{group_id}")
+async def delete_group(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if not owner_id:
+        raise HTTPException(status_code=404, detail="group not found")
+    if owner_id != current_user_id:
+        raise HTTPException(status_code=403, detail="only group owner can delete group")
+    await _db_call(_delete_group_uploads, group_id)
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
+    return {"status": "deleted", "group_id": group_id}
+
+
 @app.get("/groups/{group_id}/members")
 async def list_group_members(
     group_id: str,
