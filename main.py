@@ -1291,13 +1291,13 @@ async def create_group_message(
         if isinstance(raw_body, str):
             body = raw_body.strip()
         upload = form.get("image")
-        if isinstance(upload, UploadFile):
+        if isinstance(upload, UploadFile) or (hasattr(upload, "file") and hasattr(upload, "filename")):
             if not upload.content_type or not upload.content_type.startswith("image/"):
                 raise HTTPException(status_code=400, detail="invalid image type")
             image_path = _save_uploaded_image(upload)
             upload.file.close()
         elif upload is not None:
-            raise HTTPException(status_code=400, detail="invalid image upload")
+            raise HTTPException(status_code=400, detail=f"invalid image upload type={type(upload).__name__}")
     else:
         try:
             payload = await request.json()
