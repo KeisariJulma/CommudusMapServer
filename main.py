@@ -1227,6 +1227,16 @@ async def set_group_sharing(user_id: str, group_id: str, payload: ShareUpdate):
     return {"status": "ok", "user_id": user_id, "group_id": group_id, "enabled": payload.enabled}
 
 
+@app.get("/groups/{group_id}/sharing")
+async def get_group_sharing(group_id: str, current_user_id: str = Depends(get_current_user_id)):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+    enabled_ids = await _db_call(_get_share_enabled_member_ids, group_id)
+    return {"group_id": group_id, "enabled_user_ids": enabled_ids}
+
+
 @app.get("/groups/{group_id}/locations", response_model=List[UserLocation])
 async def get_group_locations(group_id: str):
     try:
