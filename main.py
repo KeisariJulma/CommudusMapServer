@@ -24,6 +24,7 @@ from firebase_admin import messaging as firebase_messaging
 
 app = FastAPI()
 DB_PATH = "app.db"
+MML_API_KEY = os.environ.get("MML_API_KEY", "6ca6d0d1-33bb-4cf4-8840-f6da4874929d")
 
 JWT_SECRET = os.environ.get("JWT_SECRET")  # set this in your shell
 JWT_ALGORITHM = "HS256"
@@ -97,6 +98,49 @@ async def get_current_user_id(token: str = Depends(oauth2_scheme)) -> str:
         return str(user_id)
     except JWTError:
         raise HTTPException(status_code=401, detail="invalid token")
+
+
+def _build_raster_style(tile_url: str, name: str) -> Dict[str, object]:
+    return {
+        "version": 8,
+        "name": name,
+        "sources": {
+            "raster-tiles": {
+                "type": "raster",
+                "tiles": [tile_url],
+                "tileSize": 256,
+                "minzoom": 0,
+                "maxzoom": 19,
+            }
+        },
+        "layers": [
+            {
+                "id": "raster-tiles-layer",
+                "type": "raster",
+                "source": "raster-tiles",
+            }
+        ],
+    }
+
+
+@app.get("/map-styles/{style_name}.json")
+def get_map_style(style_name: str) -> Dict[str, object]:
+    style = style_name.lower()
+    if style == "mml":
+        tile_url = (
+            "https://avoin-karttakuva.maanmittauslaitos.fi/avoin/wmts/1.0.0/"
+            f"maastokartta/default/WGS84_Pseudo-Mercator/{{z}}/{{y}}/{{x}}.png?api-key={MML_API_KEY}"
+        )
+        return _build_raster_style(tile_url, "commudus-mml")
+    if style == "satellite":
+        tile_url = (
+            "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+        )
+        return _build_raster_style(tile_url, "commudus-satellite")
+    if style == "osm":
+        tile_url = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+        return _build_raster_style(tile_url, "commudus-osm")
+    raise HTTPException(status_code=404, detail="unknown style")
 
 # -----------------------
 # Database Utilities
