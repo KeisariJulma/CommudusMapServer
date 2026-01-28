@@ -325,6 +325,10 @@ def _save_uploaded_image(upload: UploadFile) -> str:
     ext = _normalize_image_extension(upload.filename or "", upload.content_type)
     filename = f"{uuid.uuid4().hex}{ext}"
     destination = UPLOAD_DIR / filename
+    try:
+        upload.file.seek(0)
+    except Exception:
+        pass
     with destination.open("wb") as out:
         shutil.copyfileobj(upload.file, out)
     return filename
