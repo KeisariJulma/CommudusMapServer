@@ -104,6 +104,7 @@ def _build_raster_style(tile_url: str, name: str) -> Dict[str, object]:
     return {
         "version": 8,
         "name": name,
+        "glyphs": "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
         "sources": {
             "raster-tiles": {
                 "type": "raster",
