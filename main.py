@@ -1,7 +1,8 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from typing import Dict, List, Optional
 import uvicorn
@@ -10,6 +11,7 @@ import asyncio
 from pathlib import Path
 import sqlite3
 import uuid
+import shutil
 import os
 import base64
 import hashlib
@@ -24,7 +26,10 @@ from firebase_admin import messaging as firebase_messaging
 
 app = FastAPI()
 DB_PATH = "app.db"
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MML_API_KEY = os.environ.get("MML_API_KEY", "6ca6d0d1-33bb-4cf4-8840-f6da4874929d")
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 JWT_SECRET = os.environ.get("JWT_SECRET")  # set this in your shell
 JWT_ALGORITHM = "HS256"
@@ -209,6 +214,7 @@ def _init_db() -> None:
               group_id TEXT NOT NULL,
               user_id TEXT NOT NULL,
               body TEXT NOT NULL,
+              image_path TEXT,
               created_at REAL NOT NULL,
               FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -239,6 +245,13 @@ def _init_db() -> None:
         except sqlite3.OperationalError:
             # column already exists
             pass
+        # Migration: add image_path to group_messages
+        try:
+            conn.execute("ALTER TABLE group_messages ADD COLUMN image_path TEXT")
+        except sqlite3.OperationalError:
+            # column already exists
+            pass
+
 
         # Optional: index for owner lookups
         try:
@@ -270,6 +283,51 @@ def _init_db() -> None:
         except sqlite3.OperationalError:
             # index already exists
             pass
+
+
+def _build_image_url(image_path: Optional[str]) -> Optional[str]:
+    if not image_path:
+        return None
+    return f"/uploads/{image_path}"
+
+
+_IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".heic",
+    ".heif",
+}
+
+
+def _normalize_image_extension(filename: str, content_type: Optional[str]) -> str:
+    ext = Path(filename or "").suffix.lower()
+    if ext in _IMAGE_EXTENSIONS:
+        return ext
+    if content_type:
+        mapping = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/heic": ".heic",
+            "image/heif": ".heif",
+        }
+        mapped = mapping.get(content_type.lower())
+        if mapped:
+            return mapped
+    return ".jpg"
+
+
+def _save_uploaded_image(upload: UploadFile) -> str:
+    ext = _normalize_image_extension(upload.filename or "", upload.content_type)
+    filename = f"{uuid.uuid4().hex}{ext}"
+    destination = UPLOAD_DIR / filename
+    with destination.open("wb") as out:
+        shutil.copyfileobj(upload.file, out)
+    return filename
 
 
 async def _db_call(fn, *args, **kwargs):
@@ -325,7 +383,7 @@ class PushTokenPayload(BaseModel):
 
 
 class ChatMessageCreate(BaseModel):
-    body: str
+    body: Optional[str] = None
 
 
 class ChatMessagePublic(BaseModel):
@@ -335,6 +393,7 @@ class ChatMessagePublic(BaseModel):
     username: str
     body: str
     created_at: float
+    image_url: Optional[str] = None
     delivered_count: int = 0
     read_count: int = 0
     recipient_count: int = 0
@@ -637,7 +696,7 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
         if before is None:
             rows = conn.execute(
                 """
-                SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.created_at
+                SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.image_path, gm.created_at
                 FROM group_messages gm
                 JOIN users u ON u.id = gm.user_id
                 WHERE gm.group_id = ?
@@ -649,7 +708,7 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
         else:
             rows = conn.execute(
                 """
-                SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.created_at
+                SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.image_path, gm.created_at
                 FROM group_messages gm
                 JOIN users u ON u.id = gm.user_id
                 WHERE gm.group_id = ? AND gm.created_at < ?
@@ -665,6 +724,7 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
                 "user_id": r["user_id"],
                 "username": r["username"],
                 "body": r["body"],
+                "image_path": r["image_path"],
                 "created_at": r["created_at"],
             }
             for r in rows
@@ -785,19 +845,19 @@ def _list_message_read_users(message_id: int) -> List[dict]:
         ]
 
 
-def _add_group_message(group_id: str, user_id: str, body: str) -> dict:
+def _add_group_message(group_id: str, user_id: str, body: str, image_path: Optional[str] = None) -> dict:
     created_at = time.time()
     with _get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO group_messages(group_id, user_id, body, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO group_messages(group_id, user_id, body, image_path, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (group_id, user_id, body, created_at),
+            (group_id, user_id, body, image_path, created_at),
         )
         row = conn.execute(
             """
-            SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.created_at
+            SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.image_path, gm.created_at
             FROM group_messages gm
             JOIN users u ON u.id = gm.user_id
             WHERE gm.group_id = ? AND gm.user_id = ? AND gm.created_at = ?
@@ -814,6 +874,7 @@ def _add_group_message(group_id: str, user_id: str, body: str) -> dict:
             "user_id": row["user_id"],
             "username": row["username"],
             "body": row["body"],
+            "image_path": row["image_path"],
             "created_at": row["created_at"],
         }
 
@@ -1148,6 +1209,9 @@ async def list_group_messages(
     messages = await _db_call(_list_group_messages, group_id, limit, before)
     if not messages:
         return messages
+    for message in messages:
+        message["image_url"] = _build_image_url(message.get("image_path"))
+        message.pop("image_path", None)
     message_ids = [int(message["id"]) for message in messages]
     recipient_ids = [
         int(message["id"])
@@ -1211,17 +1275,41 @@ async def get_message_receipts(
 @app.post("/groups/{group_id}/messages", response_model=ChatMessagePublic)
 async def create_group_message(
     group_id: str,
-    payload: ChatMessageCreate,
+    request: Request,
     current_user_id: str = Depends(get_current_user_id),
 ):
     if not await _db_call(_group_exists, group_id):
         raise HTTPException(status_code=404, detail="group not found")
     if not await _db_call(_is_member, group_id, current_user_id):
         raise HTTPException(status_code=403, detail="not a member of this group")
-    body = payload.body.strip()
-    if not body:
-        raise HTTPException(status_code=400, detail="message body required")
-    message = await _db_call(_add_group_message, group_id, current_user_id, body)
+    body = ""
+    image_path: Optional[str] = None
+    content_type = (request.headers.get("content-type") or "").lower()
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        raw_body = form.get("body")
+        if isinstance(raw_body, str):
+            body = raw_body.strip()
+        upload = form.get("image")
+        if isinstance(upload, UploadFile):
+            if not upload.content_type or not upload.content_type.startswith("image/"):
+                raise HTTPException(status_code=400, detail="invalid image type")
+            image_path = _save_uploaded_image(upload)
+            upload.file.close()
+        elif upload is not None:
+            raise HTTPException(status_code=400, detail="invalid image upload")
+    else:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            body = str(payload.get("body") or "").strip()
+    if not body and not image_path:
+        raise HTTPException(status_code=400, detail="message body or image required")
+    message = await _db_call(_add_group_message, group_id, current_user_id, body, image_path)
+    image_url = _build_image_url(message.get("image_path"))
+    message.pop("image_path", None)
     member_count = await _db_call(_count_group_members, group_id)
     recipient_count = max(0, member_count - 1)
     if FCM_SERVICE_ACCOUNT_FILE:
@@ -1232,7 +1320,8 @@ async def create_group_message(
             tokens.extend(await _db_call(_list_push_tokens, uid))
         if tokens:
             deduped = list(dict.fromkeys(tokens))
-            body_preview = message["body"][:80]
+            body_text = (message.get("body") or "").strip()
+            body_preview = body_text[:80] if body_text else ("Kuva" if image_url else "")
             group_name = await _db_call(_get_group_name, group_id)
             data = {
                 "type": "chat",
@@ -1249,6 +1338,7 @@ async def create_group_message(
             )
     return {
         **message,
+        "image_url": image_url,
         "delivered_count": 0,
         "read_count": 0,
         "recipient_count": recipient_count,
