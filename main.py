@@ -86,6 +86,22 @@ def _verify_password(password: str, stored: str) -> bool:
         return False
 
 
+def _parse_optional_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
+
+
 def _create_access_token(user_id: str) -> str:
     if not JWT_SECRET:
         raise RuntimeError("JWT_SECRET is not set (export JWT_SECRET='<your-strong-secret>')")
@@ -215,6 +231,10 @@ def _init_db() -> None:
               user_id TEXT NOT NULL,
               body TEXT NOT NULL,
               image_path TEXT,
+              image_lat REAL,
+              image_lon REAL,
+              image_accuracy REAL,
+              image_timestamp REAL,
               created_at REAL NOT NULL,
               FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -251,6 +271,18 @@ def _init_db() -> None:
         except sqlite3.OperationalError:
             # column already exists
             pass
+        # Migration: add image location columns to group_messages
+        for stmt in (
+            "ALTER TABLE group_messages ADD COLUMN image_lat REAL",
+            "ALTER TABLE group_messages ADD COLUMN image_lon REAL",
+            "ALTER TABLE group_messages ADD COLUMN image_accuracy REAL",
+            "ALTER TABLE group_messages ADD COLUMN image_timestamp REAL",
+        ):
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                # column already exists
+                pass
 
 
         # Optional: index for owner lookups
@@ -400,6 +432,10 @@ class ChatMessagePublic(BaseModel):
     body: str
     created_at: float
     image_url: Optional[str] = None
+    image_lat: Optional[float] = None
+    image_lon: Optional[float] = None
+    image_accuracy: Optional[float] = None
+    image_timestamp: Optional[float] = None
     delivered_count: int = 0
     read_count: int = 0
     recipient_count: int = 0
@@ -702,7 +738,8 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
         if before is None:
             rows = conn.execute(
                 """
-                SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.image_path, gm.created_at
+                SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.image_path,
+                       gm.image_lat, gm.image_lon, gm.image_accuracy, gm.image_timestamp, gm.created_at
                 FROM group_messages gm
                 JOIN users u ON u.id = gm.user_id
                 WHERE gm.group_id = ?
@@ -714,7 +751,8 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
         else:
             rows = conn.execute(
                 """
-                SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.image_path, gm.created_at
+                SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.image_path,
+                       gm.image_lat, gm.image_lon, gm.image_accuracy, gm.image_timestamp, gm.created_at
                 FROM group_messages gm
                 JOIN users u ON u.id = gm.user_id
                 WHERE gm.group_id = ? AND gm.created_at < ?
@@ -731,6 +769,10 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
                 "username": r["username"],
                 "body": r["body"],
                 "image_path": r["image_path"],
+                "image_lat": r["image_lat"],
+                "image_lon": r["image_lon"],
+                "image_accuracy": r["image_accuracy"],
+                "image_timestamp": r["image_timestamp"],
                 "created_at": r["created_at"],
             }
             for r in rows
@@ -893,19 +935,49 @@ def _list_message_read_users(message_id: int) -> List[dict]:
         ]
 
 
-def _add_group_message(group_id: str, user_id: str, body: str, image_path: Optional[str] = None) -> dict:
+def _add_group_message(
+    group_id: str,
+    user_id: str,
+    body: str,
+    image_path: Optional[str] = None,
+    image_lat: Optional[float] = None,
+    image_lon: Optional[float] = None,
+    image_accuracy: Optional[float] = None,
+    image_timestamp: Optional[float] = None,
+) -> dict:
     created_at = time.time()
     with _get_conn() as conn:
         conn.execute(
             """
-            INSERT INTO group_messages(group_id, user_id, body, image_path, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO group_messages(
+                group_id,
+                user_id,
+                body,
+                image_path,
+                image_lat,
+                image_lon,
+                image_accuracy,
+                image_timestamp,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (group_id, user_id, body, image_path, created_at),
+            (
+                group_id,
+                user_id,
+                body,
+                image_path,
+                image_lat,
+                image_lon,
+                image_accuracy,
+                image_timestamp,
+                created_at,
+            ),
         )
         row = conn.execute(
             """
-            SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.image_path, gm.created_at
+            SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.image_path,
+                   gm.image_lat, gm.image_lon, gm.image_accuracy, gm.image_timestamp, gm.created_at
             FROM group_messages gm
             JOIN users u ON u.id = gm.user_id
             WHERE gm.group_id = ? AND gm.user_id = ? AND gm.created_at = ?
@@ -923,6 +995,10 @@ def _add_group_message(group_id: str, user_id: str, body: str, image_path: Optio
             "username": row["username"],
             "body": row["body"],
             "image_path": row["image_path"],
+            "image_lat": row["image_lat"],
+            "image_lon": row["image_lon"],
+            "image_accuracy": row["image_accuracy"],
+            "image_timestamp": row["image_timestamp"],
             "created_at": row["created_at"],
         }
 
@@ -1351,6 +1427,10 @@ async def create_group_message(
         raise HTTPException(status_code=403, detail="not a member of this group")
     body = ""
     image_path: Optional[str] = None
+    image_lat: Optional[float] = None
+    image_lon: Optional[float] = None
+    image_accuracy: Optional[float] = None
+    image_timestamp: Optional[float] = None
     content_type = (request.headers.get("content-type") or "").lower()
     if content_type.startswith("multipart/form-data"):
         form = await request.form()
@@ -1363,6 +1443,15 @@ async def create_group_message(
                 raise HTTPException(status_code=400, detail="invalid image type")
             image_path = _save_uploaded_image(upload)
             upload.file.close()
+            image_lat = _parse_optional_float(form.get("image_lat"))
+            image_lon = _parse_optional_float(form.get("image_lon"))
+            image_accuracy = _parse_optional_float(form.get("image_accuracy"))
+            image_timestamp = _parse_optional_float(form.get("image_timestamp"))
+            if image_lat is None or image_lon is None:
+                image_lat = None
+                image_lon = None
+                image_accuracy = None
+                image_timestamp = None
         elif upload is not None:
             raise HTTPException(status_code=400, detail=f"invalid image upload type={type(upload).__name__}")
     else:
@@ -1374,7 +1463,17 @@ async def create_group_message(
             body = str(payload.get("body") or "").strip()
     if not body and not image_path:
         raise HTTPException(status_code=400, detail="message body or image required")
-    message = await _db_call(_add_group_message, group_id, current_user_id, body, image_path)
+    message = await _db_call(
+        _add_group_message,
+        group_id,
+        current_user_id,
+        body,
+        image_path,
+        image_lat,
+        image_lon,
+        image_accuracy,
+        image_timestamp,
+    )
     image_url = _build_image_url(message.get("image_path"))
     message.pop("image_path", None)
     member_count = await _db_call(_count_group_members, group_id)
