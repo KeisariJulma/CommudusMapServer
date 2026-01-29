@@ -102,6 +102,26 @@ def _parse_optional_float(value: object) -> Optional[float]:
     return None
 
 
+def _normalize_phone(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    trimmed = value.strip()
+    if not trimmed:
+        return None
+    cleaned = "".join(ch for ch in trimmed if (ch.isdigit() or ch == "+"))
+    if not any(ch.isdigit() for ch in cleaned):
+        return None
+    if cleaned.count("+") > 1:
+        cleaned = cleaned.replace("+", "")
+        cleaned = f"+{cleaned}" if cleaned else ""
+    if "+" in cleaned and not cleaned.startswith("+"):
+        cleaned = cleaned.replace("+", "")
+    return cleaned or None
+
+
+UNSET = object()
+
+
 def _create_access_token(user_id: str) -> str:
     if not JWT_SECRET:
         raise RuntimeError("JWT_SECRET is not set (export JWT_SECRET='<your-strong-secret>')")
@@ -181,7 +201,7 @@ def _init_db() -> None:
             CREATE TABLE IF NOT EXISTS users (
               id TEXT PRIMARY KEY,
               name TEXT NOT NULL,
-              email TEXT NOT NULL UNIQUE,
+              email TEXT UNIQUE,
               phone TEXT,
               password_hash TEXT NOT NULL,
               created_at REAL NOT NULL
@@ -272,6 +292,38 @@ def _init_db() -> None:
             conn.execute("ALTER TABLE users ADD COLUMN phone TEXT")
         except sqlite3.OperationalError:
             # column already exists
+            pass
+
+        # Migration: allow NULL email and ensure unique phone
+        try:
+            columns = conn.execute("PRAGMA table_info(users)").fetchall()
+            email_notnull = next((col["notnull"] for col in columns if col["name"] == "email"), 0)
+            if email_notnull:
+                conn.execute("PRAGMA foreign_keys = OFF")
+                try:
+                    conn.execute(
+                        "CREATE TABLE users_new ("
+                        "id TEXT PRIMARY KEY, "
+                        "name TEXT NOT NULL, "
+                        "email TEXT UNIQUE, "
+                        "phone TEXT UNIQUE, "
+                        "password_hash TEXT NOT NULL, "
+                        "created_at REAL NOT NULL)"
+                    )
+                    conn.execute(
+                        "INSERT INTO users_new(id, name, email, phone, password_hash, created_at) "
+                        "SELECT id, name, email, phone, password_hash, created_at FROM users"
+                    )
+                    conn.execute("DROP TABLE users")
+                    conn.execute("ALTER TABLE users_new RENAME TO users")
+                finally:
+                    conn.execute("PRAGMA foreign_keys = ON")
+            else:
+                try:
+                    conn.execute("CREATE UNIQUE INDEX idx_users_phone ON users(phone)")
+                except sqlite3.OperationalError:
+                    pass
+        except sqlite3.OperationalError:
             pass
         # Migration: add image_path to group_messages
         try:
@@ -385,7 +437,7 @@ async def _db_call(fn, *args, **kwargs):
 # -----------------------
 class UserCreate(BaseModel):
     name: str
-    email: EmailStr
+    email: Optional[EmailStr] = None
     password: str
     phone: Optional[str] = None
 
@@ -393,7 +445,7 @@ class UserCreate(BaseModel):
 class UserPublic(BaseModel):
     id: str
     name: str
-    email: EmailStr
+    email: Optional[EmailStr] = None
     phone: Optional[str] = None
 
 
@@ -401,8 +453,16 @@ class UserPhoneUpdate(BaseModel):
     phone: Optional[str] = None
 
 
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+
+
 class LoginRequest(BaseModel):
-    email: EmailStr
+    identifier: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
     password: str
 
 
@@ -471,7 +531,12 @@ class MessageReceiptSummary(BaseModel):
 # -----------------------
 # User CRUD
 # -----------------------
-def _create_user(name: str, email: str, password: str, phone: Optional[str] = None) -> UserPublic:
+def _create_user(
+    name: str,
+    email: Optional[str],
+    password: str,
+    phone: Optional[str] = None,
+) -> UserPublic:
     user_id = str(uuid.uuid4())
     password_hash = _hash_password(password)
     now = time.time()
@@ -482,7 +547,7 @@ def _create_user(name: str, email: str, password: str, phone: Optional[str] = No
                 (user_id, name, email, phone, password_hash, now),
             )
     except sqlite3.IntegrityError:
-        raise ValueError("email_already_exists")
+        raise ValueError("email_or_phone_exists")
     return UserPublic(id=user_id, name=name, email=email, phone=phone)
 
 
@@ -491,14 +556,58 @@ def _get_user_by_email(email: str) -> Optional[sqlite3.Row]:
         return conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
 
 
+
+def _get_user_by_phone(phone: str) -> Optional[sqlite3.Row]:
+    with _get_conn() as conn:
+        return conn.execute("SELECT * FROM users WHERE phone = ?", (phone,)).fetchone()
+
+
 def _get_user_by_id(user_id: str) -> Optional[sqlite3.Row]:
     with _get_conn() as conn:
         return conn.execute("SELECT id, name, email, phone FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
 def _update_user_phone(user_id: str, phone: Optional[str]) -> Optional[sqlite3.Row]:
+    return _update_user(user_id, UNSET, UNSET, phone)
+
+
+
+def _update_user(
+    user_id: str,
+    name: object,
+    email: object,
+    phone: object,
+) -> Optional[sqlite3.Row]:
     with _get_conn() as conn:
-        conn.execute("UPDATE users SET phone = ? WHERE id = ?", (phone, user_id))
+        row = conn.execute("SELECT id, name, email, phone FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            return None
+        next_name = row["name"] if name is UNSET else name
+        next_email = row["email"] if email is UNSET else email
+        next_phone = row["phone"] if phone is UNSET else phone
+        if name is not UNSET and next_name is None:
+            return None
+        if email is not UNSET and next_email is not None:
+            existing = conn.execute(
+                "SELECT id FROM users WHERE email = ? AND id != ?",
+                (next_email, user_id),
+            ).fetchone()
+            if existing:
+                raise ValueError("email_already_exists")
+        if phone is not UNSET and next_phone is not None:
+            existing = conn.execute(
+                "SELECT id FROM users WHERE phone = ? AND id != ?",
+                (next_phone, user_id),
+            ).fetchone()
+            if existing:
+                raise ValueError("phone_already_exists")
+        try:
+            conn.execute(
+                "UPDATE users SET name = ?, email = ?, phone = ? WHERE id = ?",
+                (next_name, next_email, next_phone, user_id),
+            )
+        except sqlite3.IntegrityError:
+            raise ValueError("email_or_phone_exists")
         return conn.execute("SELECT id, name, email, phone FROM users WHERE id = ?", (user_id,)).fetchone()
 
 
@@ -1114,6 +1223,44 @@ async def get_user(user_id: str):
     return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"]}
 
 
+@app.put("/users/{user_id}", response_model=UserPublic)
+async def update_user(
+    user_id: str,
+    payload: UserUpdate,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if current_user_id != user_id:
+        raise HTTPException(status_code=403, detail="cannot update another user")
+    name_value = payload.name.strip() if payload.name is not None else UNSET
+    if payload.name is not None and not name_value:
+        raise HTTPException(status_code=400, detail="name required")
+    email_value = UNSET
+    if payload.email is not None:
+        email_value = str(payload.email).strip()
+        if not email_value:
+            raise HTTPException(status_code=400, detail="email required")
+    phone_value = UNSET
+    if payload.phone is not None:
+        trimmed_phone = payload.phone.strip()
+        if not trimmed_phone:
+            phone_value = None
+        else:
+            phone_value = _normalize_phone(trimmed_phone)
+            if not phone_value:
+                raise HTTPException(status_code=400, detail="phone required")
+    try:
+        row = await _db_call(_update_user, user_id, name_value, email_value, phone_value)
+    except ValueError as exc:
+        if str(exc) == "email_already_exists":
+            raise HTTPException(status_code=409, detail="email already exists")
+        if str(exc) == "phone_already_exists":
+            raise HTTPException(status_code=409, detail="phone already exists")
+        raise
+    if not row:
+        raise HTTPException(status_code=404, detail="user not found")
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"]}
+
+
 @app.get("/users/by-email/{email}", response_model=UserPublic)
 async def get_user_by_email(email: EmailStr, current_user_id: str = Depends(get_current_user_id)):
     row = await _db_call(_get_user_by_email, str(email))
@@ -1130,9 +1277,21 @@ async def update_user_phone(
 ):
     if current_user_id != user_id:
         raise HTTPException(status_code=403, detail="cannot update another user")
-    phone_value = (payload.phone or "").strip()
-    phone_value = phone_value or None
-    row = await _db_call(_update_user_phone, user_id, phone_value)
+    if payload.phone is None:
+        raise HTTPException(status_code=400, detail="phone required")
+    trimmed_phone = payload.phone.strip()
+    if trimmed_phone:
+        phone_value = _normalize_phone(trimmed_phone)
+        if not phone_value:
+            raise HTTPException(status_code=400, detail="phone required")
+    else:
+        phone_value = None
+    try:
+        row = await _db_call(_update_user_phone, user_id, phone_value)
+    except ValueError as exc:
+        if str(exc) == "phone_already_exists":
+            raise HTTPException(status_code=409, detail="phone already exists")
+        raise
     if not row:
         raise HTTPException(status_code=404, detail="user not found")
     return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"]}
@@ -1167,19 +1326,44 @@ async def register_push_token(
 
 @app.post("/users", response_model=UserPublic)
 async def create_user(payload: UserCreate):
+    email_value = str(payload.email) if payload.email is not None else None
+    phone_value = None
+    if payload.phone is not None:
+        phone_value = _normalize_phone(payload.phone)
+        if payload.phone.strip() and not phone_value:
+            raise HTTPException(status_code=400, detail="phone required")
+    if not email_value and not phone_value:
+        raise HTTPException(status_code=400, detail="email or phone required")
+    if email_value:
+        existing = await _db_call(_get_user_by_email, email_value)
+        if existing:
+            raise HTTPException(status_code=409, detail="email already exists")
+    if phone_value:
+        existing = await _db_call(_get_user_by_phone, phone_value)
+        if existing:
+            raise HTTPException(status_code=409, detail="phone already exists")
     try:
         return await _db_call(
-            _create_user, payload.name, str(payload.email), payload.password, payload.phone
+            _create_user, payload.name, email_value, payload.password, phone_value
         )
     except ValueError as e:
-        if str(e) == "email_already_exists":
-            raise HTTPException(status_code=409, detail="email already exists")
+        if str(e) == "email_or_phone_exists":
+            raise HTTPException(status_code=409, detail="email or phone already exists")
         raise
 
 
 @app.post("/auth/login")
 async def login(payload: "LoginRequest"):
-    row = await _db_call(_get_user_by_email, str(payload.email))
+    identifier = (payload.identifier or payload.email or payload.phone or "").strip()
+    if not identifier:
+        raise HTTPException(status_code=400, detail="identifier required")
+    if "@" in identifier:
+        row = await _db_call(_get_user_by_email, identifier)
+    else:
+        phone_value = _normalize_phone(identifier)
+        if not phone_value:
+            raise HTTPException(status_code=400, detail="phone required")
+        row = await _db_call(_get_user_by_phone, phone_value)
     if not row or not _verify_password(payload.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="invalid credentials")
 
