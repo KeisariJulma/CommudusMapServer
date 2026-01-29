@@ -182,6 +182,7 @@ def _init_db() -> None:
               id TEXT PRIMARY KEY,
               name TEXT NOT NULL,
               email TEXT NOT NULL UNIQUE,
+              phone TEXT,
               password_hash TEXT NOT NULL,
               created_at REAL NOT NULL
             );
@@ -262,6 +263,13 @@ def _init_db() -> None:
         # Migration: add name to groups (SQLite doesn't support IF NOT EXISTS for columns)
         try:
             conn.execute("ALTER TABLE groups ADD COLUMN name TEXT")
+        except sqlite3.OperationalError:
+            # column already exists
+            pass
+
+        # Migration: add phone to users
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN phone TEXT")
         except sqlite3.OperationalError:
             # column already exists
             pass
@@ -379,12 +387,18 @@ class UserCreate(BaseModel):
     name: str
     email: EmailStr
     password: str
+    phone: Optional[str] = None
 
 
 class UserPublic(BaseModel):
     id: str
     name: str
     email: EmailStr
+    phone: Optional[str] = None
+
+
+class UserPhoneUpdate(BaseModel):
+    phone: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
@@ -457,19 +471,19 @@ class MessageReceiptSummary(BaseModel):
 # -----------------------
 # User CRUD
 # -----------------------
-def _create_user(name: str, email: str, password: str) -> UserPublic:
+def _create_user(name: str, email: str, password: str, phone: Optional[str] = None) -> UserPublic:
     user_id = str(uuid.uuid4())
     password_hash = _hash_password(password)
     now = time.time()
     try:
         with _get_conn() as conn:
             conn.execute(
-                "INSERT INTO users(id, name, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, name, email, password_hash, now),
+                "INSERT INTO users(id, name, email, phone, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, name, email, phone, password_hash, now),
             )
     except sqlite3.IntegrityError:
         raise ValueError("email_already_exists")
-    return UserPublic(id=user_id, name=name, email=email)
+    return UserPublic(id=user_id, name=name, email=email, phone=phone)
 
 
 def _get_user_by_email(email: str) -> Optional[sqlite3.Row]:
@@ -479,7 +493,19 @@ def _get_user_by_email(email: str) -> Optional[sqlite3.Row]:
 
 def _get_user_by_id(user_id: str) -> Optional[sqlite3.Row]:
     with _get_conn() as conn:
-        return conn.execute("SELECT id, name, email FROM users WHERE id = ?", (user_id,)).fetchone()
+        return conn.execute("SELECT id, name, email, phone FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
+def _update_user_phone(user_id: str, phone: Optional[str]) -> Optional[sqlite3.Row]:
+    with _get_conn() as conn:
+        conn.execute("UPDATE users SET phone = ? WHERE id = ?", (phone, user_id))
+        return conn.execute("SELECT id, name, email, phone FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
+def _delete_user(user_id: str) -> bool:
+    with _get_conn() as conn:
+        cursor = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        return cursor.rowcount > 0
 
 
 def _user_exists(user_id: str) -> bool:
@@ -1085,7 +1111,7 @@ async def get_user(user_id: str):
     row = await _db_call(_get_user_by_id, user_id)
     if not row:
         raise HTTPException(status_code=404, detail="user not found")
-    return {"id": row["id"], "name": row["name"], "email": row["email"]}
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"]}
 
 
 @app.get("/users/by-email/{email}", response_model=UserPublic)
@@ -1093,7 +1119,36 @@ async def get_user_by_email(email: EmailStr, current_user_id: str = Depends(get_
     row = await _db_call(_get_user_by_email, str(email))
     if not row:
         raise HTTPException(status_code=404, detail="user not found")
-    return {"id": row["id"], "name": row["name"], "email": row["email"]}
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"]}
+
+
+@app.put("/users/{user_id}/phone", response_model=UserPublic)
+async def update_user_phone(
+    user_id: str,
+    payload: UserPhoneUpdate,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if current_user_id != user_id:
+        raise HTTPException(status_code=403, detail="cannot update another user")
+    phone_value = (payload.phone or "").strip()
+    phone_value = phone_value or None
+    row = await _db_call(_update_user_phone, user_id, phone_value)
+    if not row:
+        raise HTTPException(status_code=404, detail="user not found")
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"]}
+
+
+@app.delete("/users/{user_id}")
+async def delete_user(
+    user_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if current_user_id != user_id:
+        raise HTTPException(status_code=403, detail="cannot delete another user")
+    deleted = await _db_call(_delete_user, user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="user not found")
+    return {"status": "deleted"}
 
 
 @app.post("/users/{user_id}/push-token")
@@ -1113,7 +1168,9 @@ async def register_push_token(
 @app.post("/users", response_model=UserPublic)
 async def create_user(payload: UserCreate):
     try:
-        return await _db_call(_create_user, payload.name, str(payload.email), payload.password)
+        return await _db_call(
+            _create_user, payload.name, str(payload.email), payload.password, payload.phone
+        )
     except ValueError as e:
         if str(e) == "email_already_exists":
             raise HTTPException(status_code=409, detail="email already exists")
