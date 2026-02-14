@@ -137,7 +137,8 @@ async def get_current_user_id(token: str = Depends(oauth2_scheme)) -> str:
         if not user_id:
             raise HTTPException(status_code=401, detail="invalid token")
         return str(user_id)
-    except JWTError:
+    except JWTError as e:
+        print("JWT error:", e)
         raise HTTPException(status_code=401, detail="invalid token")
 
 
