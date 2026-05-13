@@ -33,7 +33,7 @@ app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 JWT_SECRET = os.environ.get("JWT_SECRET")  # set this in your shell
 JWT_ALGORITHM = "HS256"
-JWT_EXPIRES_SECONDS = 60 * 60 * 24 * 7  # 7 days
+JWT_EXPIRES_SECONDS = 60 * 60 * 24 * 365 * 10   # 7 days
 FCM_SERVICE_ACCOUNT_FILE = os.environ.get("FCM_SERVICE_ACCOUNT_FILE") or os.environ.get(
     "GOOGLE_APPLICATION_CREDENTIALS"
 )
@@ -467,6 +467,11 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+    new_password: str
+
+
 class UserLocation(BaseModel):
     user_id: str
     username: str
@@ -555,6 +560,16 @@ def _create_user(
 def _get_user_by_email(email: str) -> Optional[sqlite3.Row]:
     with _get_conn() as conn:
         return conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+
+
+def _reset_password_by_email(email: str, new_password: str) -> bool:
+    password_hash = _hash_password(new_password)
+    with _get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE users SET password_hash = ? WHERE email = ?",
+            (password_hash, email),
+        )
+        return cursor.rowcount > 0
 
 
 
@@ -1370,6 +1385,14 @@ async def login(payload: "LoginRequest"):
 
     token = _create_access_token(row["id"])
     return {"access_token": token, "token_type": "bearer"}
+
+
+@app.post("/auth/reset-password")
+async def reset_password(payload: PasswordResetRequest):
+    if not payload.new_password.strip():
+        raise HTTPException(status_code=400, detail="new password required")
+    await _db_call(_reset_password_by_email, str(payload.email), payload.new_password)
+    return {"status": "ok"}
 
 # -----------------------
 # Routes: Groups
