@@ -17,7 +17,11 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
+import smtplib
 import urllib.request
+import urllib.parse
+from email.message import EmailMessage
 
 from jose import jwt, JWTError
 import firebase_admin
@@ -34,6 +38,13 @@ app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 JWT_SECRET = os.environ.get("JWT_SECRET")  # set this in your shell
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRES_SECONDS = 60 * 60 * 24 * 365 * 10   # 7 days
+PASSWORD_RESET_EXPIRES_SECONDS = int(os.environ.get("PASSWORD_RESET_EXPIRES_SECONDS", "3600"))
+PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "http://localhost:8000")
+SMTP_HOST = os.environ.get("SMTP_HOST")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USERNAME or "no-reply@localhost")
 FCM_SERVICE_ACCOUNT_FILE = os.environ.get("FCM_SERVICE_ACCOUNT_FILE") or os.environ.get(
     "GOOGLE_APPLICATION_CREDENTIALS"
 )
@@ -247,6 +258,16 @@ def _init_db() -> None:
               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              token_hash TEXT NOT NULL UNIQUE,
+              expires_at REAL NOT NULL,
+              used_at REAL,
+              created_at REAL NOT NULL,
+              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS group_messages (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               group_id TEXT NOT NULL,
@@ -377,6 +398,14 @@ def _init_db() -> None:
             # index already exists
             pass
 
+        try:
+            conn.execute(
+                "CREATE INDEX idx_password_reset_tokens_user ON password_reset_tokens(user_id)"
+            )
+        except sqlite3.OperationalError:
+            # index already exists
+            pass
+
         _purge_empty_groups()
 
 
@@ -467,8 +496,12 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class PasswordResetRequest(BaseModel):
+class ForgotPasswordRequest(BaseModel):
     email: EmailStr
+
+
+class PasswordResetRequest(BaseModel):
+    token: str
     new_password: str
 
 
@@ -562,12 +595,83 @@ def _get_user_by_email(email: str) -> Optional[sqlite3.Row]:
         return conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
 
 
-def _reset_password_by_email(email: str, new_password: str) -> bool:
-    password_hash = _hash_password(new_password)
+def _hash_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _create_password_reset_token(email: str) -> Optional[str]:
+    row = _get_user_by_email(email)
+    if not row:
+        return None
+
+    token = secrets.token_urlsafe(32)
+    token_hash = _hash_reset_token(token)
+    now = time.time()
+    expires_at = now + PASSWORD_RESET_EXPIRES_SECONDS
     with _get_conn() as conn:
+        conn.execute(
+            "UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL",
+            (now, row["id"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO password_reset_tokens(id, user_id, token_hash, expires_at, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (str(uuid.uuid4()), row["id"], token_hash, expires_at, now),
+        )
+    return token
+
+
+def _build_password_reset_url(token: str) -> str:
+    encoded_token = urllib.parse.quote(token, safe="")
+    return f"{PUBLIC_APP_URL.rstrip('/')}/reset-password?token={encoded_token}"
+
+
+def _send_password_reset_email(email: str, token: str) -> None:
+    reset_url = _build_password_reset_url(token)
+    if not SMTP_HOST:
+        print(f"Password reset link for {email}: {reset_url}")
+        return
+
+    message = EmailMessage()
+    message["Subject"] = "Reset your Commudus password"
+    message["From"] = SMTP_FROM
+    message["To"] = email
+    message.set_content(
+        "Use this link to reset your password. "
+        f"It expires in {PASSWORD_RESET_EXPIRES_SECONDS // 60} minutes.\n\n{reset_url}\n"
+    )
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
+        smtp.starttls()
+        if SMTP_USERNAME and SMTP_PASSWORD:
+            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+        smtp.send_message(message)
+
+
+def _reset_password_with_token(token: str, new_password: str) -> bool:
+    token_hash = _hash_reset_token(token)
+    password_hash = _hash_password(new_password)
+    now = time.time()
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, user_id FROM password_reset_tokens
+            WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?
+            """,
+            (token_hash, now),
+        ).fetchone()
+        if not row:
+            return False
+
         cursor = conn.execute(
-            "UPDATE users SET password_hash = ? WHERE email = ?",
-            (password_hash, email),
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (password_hash, row["user_id"]),
+        )
+        conn.execute(
+            "UPDATE password_reset_tokens SET used_at = ? WHERE id = ?",
+            (now, row["id"]),
         )
         return cursor.rowcount > 0
 
@@ -1387,11 +1491,23 @@ async def login(payload: "LoginRequest"):
     return {"access_token": token, "token_type": "bearer"}
 
 
+@app.post("/auth/forgot-password")
+async def forgot_password(payload: ForgotPasswordRequest):
+    token = await _db_call(_create_password_reset_token, str(payload.email))
+    if token:
+        await asyncio.to_thread(_send_password_reset_email, str(payload.email), token)
+    return {"status": "ok"}
+
+
 @app.post("/auth/reset-password")
 async def reset_password(payload: PasswordResetRequest):
+    if not payload.token.strip():
+        raise HTTPException(status_code=400, detail="token required")
     if not payload.new_password.strip():
         raise HTTPException(status_code=400, detail="new password required")
-    await _db_call(_reset_password_by_email, str(payload.email), payload.new_password)
+    updated = await _db_call(_reset_password_with_token, payload.token, payload.new_password)
+    if not updated:
+        raise HTTPException(status_code=400, detail="invalid or expired reset token")
     return {"status": "ok"}
 
 # -----------------------
