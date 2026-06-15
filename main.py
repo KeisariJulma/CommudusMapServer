@@ -1142,18 +1142,36 @@ def _create_group(group_id: str, name: Optional[str] = None) -> GroupPublic:
     return GroupPublic(id=row["id"], name=row["name"] if row else name, owner_user_id=owner_user_id)
 
 
-def _list_groups() -> List[dict]:
+def _list_user_groups(user_id: str) -> List[dict]:
     with _get_conn() as conn:
-        rows = conn.execute("SELECT id, name, owner_user_id FROM groups ORDER BY id").fetchall()
+        rows = conn.execute(
+            """
+            SELECT g.id, g.name, g.owner_user_id
+            FROM groups g
+            JOIN group_members gm ON gm.group_id = g.id
+            WHERE gm.user_id = ?
+            ORDER BY g.id
+            """,
+            (user_id,),
+        ).fetchall()
         return [
             {"id": r["id"], "name": r["name"], "owner_user_id": r["owner_user_id"]}
             for r in rows
         ]
 
 
-def _list_group_ids() -> List[str]:
+def _list_user_group_ids(user_id: str) -> List[str]:
     with _get_conn() as conn:
-        rows = conn.execute("SELECT id FROM groups ORDER BY id").fetchall()
+        rows = conn.execute(
+            """
+            SELECT g.id
+            FROM groups g
+            JOIN group_members gm ON gm.group_id = g.id
+            WHERE gm.user_id = ?
+            ORDER BY g.id
+            """,
+            (user_id,),
+        ).fetchall()
         return [r["id"] for r in rows]
 
 
@@ -2177,13 +2195,13 @@ async def create_group(payload: GroupCreate, current_user_id: str = Depends(get_
 
 
 @app.get("/groups")
-async def list_groups():
-    groups = await _db_call(_list_groups)
+async def list_groups(current_user_id: str = Depends(get_current_user_id)):
+    groups = await _db_call(_list_user_groups, current_user_id)
     return {"groups": groups}
 
 @app.get("/groups/ids")
 async def list_group_ids_get(current_user_id: str = Depends(get_current_user_id)):
-    groups = await _db_call(_list_group_ids)
+    groups = await _db_call(_list_user_group_ids, current_user_id)
     return {"groups": groups}
 
 @app.post("/groups/{group_id}/requests")
