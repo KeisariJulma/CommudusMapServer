@@ -649,11 +649,14 @@ def _send_password_reset_email(email: str, token: str) -> None:
         f"It expires in {PASSWORD_RESET_EXPIRES_SECONDS // 60} minutes.\n\n{reset_url}\n"
     )
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
-        smtp.starttls()
-        if SMTP_USERNAME and SMTP_PASSWORD:
-            smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-        smtp.send_message(message)
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
+            smtp.starttls()
+            if SMTP_USERNAME and SMTP_PASSWORD:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException) as e:
+        raise RuntimeError(f"SMTP password reset email failed: {e}") from e
 
 
 def _send_firebase_password_reset_email(email: str) -> str:
@@ -1551,6 +1554,8 @@ async def forgot_password(payload: ForgotPasswordRequest):
             return {"status": "ok"}
 
         print(f"Firebase password reset skipped for {email}: email not found in Firebase Auth")
+    else:
+        print("Firebase password reset is not configured; using local SMTP reset flow")
 
     token = await _db_call(_create_password_reset_token, email)
     if token:
@@ -1561,6 +1566,158 @@ async def forgot_password(payload: ForgotPasswordRequest):
     else:
         print(f"Password reset skipped for {email}: email not found in local users")
     return {"status": "ok"}
+
+
+@app.get("/reset-password", response_class=HTMLResponse)
+async def reset_password_page(token: str = ""):
+    token_json = json.dumps(token)
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reset password</title>
+  <style>
+    :root {{
+      color-scheme: light dark;
+      font-family: Arial, sans-serif;
+    }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #f4f6f8;
+      color: #17202a;
+    }}
+    main {{
+      width: min(100% - 32px, 420px);
+      padding: 28px;
+      background: #ffffff;
+      border: 1px solid #d8dee4;
+      border-radius: 8px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+    }}
+    h1 {{
+      margin: 0 0 20px;
+      font-size: 24px;
+    }}
+    label {{
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 700;
+    }}
+    input, button {{
+      box-sizing: border-box;
+      width: 100%;
+      min-height: 44px;
+      border-radius: 6px;
+      font: inherit;
+    }}
+    input {{
+      margin-bottom: 14px;
+      padding: 10px 12px;
+      border: 1px solid #c7ced6;
+      background: #ffffff;
+      color: #17202a;
+    }}
+    button {{
+      border: 0;
+      background: #166534;
+      color: #ffffff;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    button:disabled {{
+      opacity: 0.65;
+      cursor: wait;
+    }}
+    #message {{
+      min-height: 22px;
+      margin-top: 14px;
+      font-size: 14px;
+    }}
+    .error {{
+      color: #b42318;
+    }}
+    .success {{
+      color: #166534;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      body {{
+        background: #111827;
+        color: #f9fafb;
+      }}
+      main {{
+        background: #1f2937;
+        border-color: #374151;
+      }}
+      input {{
+        background: #111827;
+        border-color: #4b5563;
+        color: #f9fafb;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Reset password</h1>
+    <form id="reset-form">
+      <label for="new-password">New password</label>
+      <input id="new-password" name="new-password" type="password" autocomplete="new-password" required minlength="1">
+      <button id="submit-button" type="submit">Update password</button>
+      <div id="message" role="status" aria-live="polite"></div>
+    </form>
+  </main>
+  <script>
+    const token = {token_json};
+    const form = document.getElementById("reset-form");
+    const passwordInput = document.getElementById("new-password");
+    const submitButton = document.getElementById("submit-button");
+    const message = document.getElementById("message");
+
+    if (!token) {{
+      submitButton.disabled = true;
+      message.className = "error";
+      message.textContent = "Reset token is missing.";
+    }}
+
+    form.addEventListener("submit", async (event) => {{
+      event.preventDefault();
+      submitButton.disabled = true;
+      message.className = "";
+      message.textContent = "Updating password...";
+
+      try {{
+        const response = await fetch("/auth/reset-password", {{
+          method: "POST",
+          headers: {{"Content-Type": "application/json"}},
+          body: JSON.stringify({{
+            token,
+            new_password: passwordInput.value,
+          }}),
+        }});
+
+        if (!response.ok) {{
+          const error = await response.json().catch(() => ({{detail: "Password reset failed"}}));
+          throw new Error(error.detail || "Password reset failed");
+        }}
+
+        message.className = "success";
+        message.textContent = "Password updated.";
+        form.reset();
+      }} catch (error) {{
+        message.className = "error";
+        message.textContent = error.message;
+        submitButton.disabled = false;
+      }}
+    }});
+  </script>
+</body>
+</html>
+"""
 
 
 @app.post("/auth/reset-password")
