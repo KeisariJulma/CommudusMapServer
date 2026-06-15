@@ -220,6 +220,94 @@ def _extract_passipaikat_payload(value: object) -> List[dict]:
     return points
 
 
+def _parse_coordinate_pair(value: object) -> Optional[List[float]]:
+    if not isinstance(value, list) or len(value) < 2:
+        return None
+    lon = _parse_finite_number(value[0])
+    lat = _parse_finite_number(value[1])
+    if lon is None or lat is None:
+        return None
+    return [lon, lat]
+
+
+def _normalize_passi_line_payload(value: object, index: int) -> Optional[dict]:
+    if not isinstance(value, dict):
+        return None
+    raw_coordinates = value.get("coordinates")
+    if not isinstance(raw_coordinates, list):
+        raw_coordinates = []
+    coordinates = [
+        coordinate
+        for raw_coordinate in raw_coordinates
+        if (coordinate := _parse_coordinate_pair(raw_coordinate)) is not None
+    ]
+    if not coordinates:
+        return None
+    raw_created_at = value.get("createdAt")
+    if raw_created_at is None:
+        raw_created_at = value.get("created_at")
+    created_at = _parse_finite_number(raw_created_at)
+    return {
+        "id": str(value.get("id") or f"passi-line-{index + 1}"),
+        "name": str(value.get("name") or f"Linja {index + 1}"),
+        "coordinates": coordinates,
+        "createdAt": int(created_at) if created_at is not None else int(time.time() * 1000),
+        "position": index,
+    }
+
+
+def _normalize_passi_ajo_group_payload(value: object, index: int) -> Optional[dict]:
+    if not isinstance(value, dict):
+        return None
+    raw_lines = value.get("lines")
+    if not isinstance(raw_lines, list):
+        raw_lines = []
+    lines = []
+    seen_line_ids = set()
+    for line_index, raw_line in enumerate(raw_lines):
+        line = _normalize_passi_line_payload(raw_line, line_index)
+        if not line or line["id"] in seen_line_ids:
+            continue
+        seen_line_ids.add(line["id"])
+        lines.append(line)
+    raw_created_at = value.get("createdAt")
+    if raw_created_at is None:
+        raw_created_at = value.get("created_at")
+    created_at = _parse_finite_number(raw_created_at)
+    return {
+        "id": str(value.get("id") or f"passi-ajo-group-{index + 1}"),
+        "name": str(value.get("name") or f"Passiajo {index + 1}"),
+        "lines": lines,
+        "createdAt": int(created_at) if created_at is not None else int(time.time() * 1000),
+        "position": index,
+    }
+
+
+def _extract_passi_ajo_groups_payload(value: object) -> List[dict]:
+    if isinstance(value, dict):
+        raw_groups = value.get("groups")
+        if not isinstance(raw_groups, list):
+            raw_groups = value.get("passi_ajo_groups")
+        if not isinstance(raw_groups, list):
+            raw_groups = value.get("passiAjoGroups")
+        if not isinstance(raw_groups, list):
+            raw_groups = []
+    elif isinstance(value, list):
+        raw_groups = value
+    else:
+        raw_groups = []
+
+    groups = []
+    seen_ids = set()
+    for index, raw_group in enumerate(raw_groups):
+        group = _normalize_passi_ajo_group_payload(raw_group, index)
+        if not group or group["id"] in seen_ids:
+            continue
+        seen_ids.add(group["id"])
+        groups.append(group)
+    return groups
+
+
 def _normalize_phone(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -410,6 +498,29 @@ def _init_db() -> None:
               PRIMARY KEY (group_id, id),
               FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS group_passi_ajo_groups (
+              group_id TEXT NOT NULL,
+              id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              position INTEGER NOT NULL,
+              PRIMARY KEY (group_id, id),
+              FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS group_passi_ajo_lines (
+              group_id TEXT NOT NULL,
+              ajo_group_id TEXT NOT NULL,
+              id TEXT NOT NULL,
+              name TEXT NOT NULL,
+              coordinates_json TEXT NOT NULL,
+              created_at INTEGER NOT NULL,
+              position INTEGER NOT NULL,
+              PRIMARY KEY (group_id, ajo_group_id, id),
+              FOREIGN KEY (group_id, ajo_group_id)
+                REFERENCES group_passi_ajo_groups(group_id, id) ON DELETE CASCADE
+            );
             """
         )
 
@@ -527,6 +638,22 @@ def _init_db() -> None:
         try:
             conn.execute(
                 "CREATE INDEX idx_group_passipaikat_group_position ON group_passipaikat(group_id, position)"
+            )
+        except sqlite3.OperationalError:
+            # index already exists
+            pass
+
+        try:
+            conn.execute(
+                "CREATE INDEX idx_group_passi_ajo_groups_group_position ON group_passi_ajo_groups(group_id, position)"
+            )
+        except sqlite3.OperationalError:
+            # index already exists
+            pass
+
+        try:
+            conn.execute(
+                "CREATE INDEX idx_group_passi_ajo_lines_group_position ON group_passi_ajo_lines(group_id, ajo_group_id, position)"
             )
         except sqlite3.OperationalError:
             # index already exists
@@ -661,6 +788,20 @@ class PassipaikkaListPublic(BaseModel):
     id: str
     name: str
     points: List[PassipaikkaPublic]
+
+
+class PassiLinePublic(BaseModel):
+    id: str
+    name: str
+    coordinates: List[List[float]]
+    createdAt: int
+
+
+class PassiAjoGroupPublic(BaseModel):
+    id: str
+    name: str
+    lines: List[PassiLinePublic]
+    createdAt: int
 
 
 class ShareUpdate(BaseModel):
@@ -1081,6 +1222,103 @@ def _replace_group_passipaikat(group_id: str, points: List[dict]) -> dict:
             (group_id,),
         ).fetchall()
         return _format_passipaikka_list(group["id"], group["name"], rows)
+
+
+def _list_group_passi_ajo_groups(group_id: str) -> List[dict]:
+    with _get_conn() as conn:
+        if not conn.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone():
+            raise ValueError("group_not_found")
+        group_rows = conn.execute(
+            """
+            SELECT id, name, created_at
+            FROM group_passi_ajo_groups
+            WHERE group_id = ?
+            ORDER BY position, created_at, id
+            """,
+            (group_id,),
+        ).fetchall()
+        line_rows = conn.execute(
+            """
+            SELECT ajo_group_id, id, name, coordinates_json, created_at
+            FROM group_passi_ajo_lines
+            WHERE group_id = ?
+            ORDER BY ajo_group_id, position, created_at, id
+            """,
+            (group_id,),
+        ).fetchall()
+
+    lines_by_group: Dict[str, List[dict]] = {}
+    for row in line_rows:
+        try:
+            coordinates = json.loads(row["coordinates_json"])
+        except json.JSONDecodeError:
+            coordinates = []
+        lines_by_group.setdefault(row["ajo_group_id"], []).append(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "coordinates": coordinates if isinstance(coordinates, list) else [],
+                "createdAt": int(row["created_at"]),
+            }
+        )
+
+    return [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "lines": lines_by_group.get(row["id"], []),
+            "createdAt": int(row["created_at"]),
+        }
+        for row in group_rows
+    ]
+
+
+def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict]) -> List[dict]:
+    with _get_conn() as conn:
+        if not conn.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone():
+            raise ValueError("group_not_found")
+        conn.execute("DELETE FROM group_passi_ajo_groups WHERE group_id = ?", (group_id,))
+        for group in groups:
+            conn.execute(
+                """
+                INSERT INTO group_passi_ajo_groups(group_id, id, name, created_at, position)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    group_id,
+                    group["id"],
+                    group["name"],
+                    group["createdAt"],
+                    group["position"],
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT INTO group_passi_ajo_lines(
+                    group_id,
+                    ajo_group_id,
+                    id,
+                    name,
+                    coordinates_json,
+                    created_at,
+                    position
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        group_id,
+                        group["id"],
+                        line["id"],
+                        line["name"],
+                        json.dumps(line["coordinates"], separators=(",", ":")),
+                        line["createdAt"],
+                        line["position"],
+                    )
+                    for line in group["lines"]
+                ],
+            )
+    return _list_group_passi_ajo_groups(group_id)
 
 
 def _add_member(group_id: str, user_id: str) -> None:
@@ -2166,6 +2404,39 @@ async def sync_group_passipaikat(
     points = _extract_passipaikat_payload(payload)
     passipaikka_list = await _db_call(_replace_group_passipaikat, group_id, points)
     return {"lists": [passipaikka_list]}
+
+
+@app.get("/groups/{group_id}/passi-ajo-groups", response_model=Dict[str, List[PassiAjoGroupPublic]])
+async def get_passi_ajo_groups(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+    groups = await _db_call(_list_group_passi_ajo_groups, group_id)
+    return {"groups": groups}
+
+
+@app.put("/groups/{group_id}/passi-ajo-groups", response_model=Dict[str, List[PassiAjoGroupPublic]])
+async def save_passi_ajo_groups(
+    group_id: str,
+    request: Request,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if owner_id != current_user_id:
+        raise HTTPException(status_code=403, detail="only group owner can save passi ajo groups")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json body")
+    groups = _extract_passi_ajo_groups_payload(payload)
+    saved_groups = await _db_call(_replace_group_passi_ajo_groups, group_id, groups)
+    return {"groups": saved_groups}
 
 
 @app.get("/groups/{group_id}/messages", response_model=List[ChatMessagePublic])
