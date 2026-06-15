@@ -308,10 +308,14 @@ def _normalize_passi_ajo_group_payload(value: object, index: int) -> Optional[di
     if raw_created_at is None:
         raw_created_at = value.get("created_at")
     created_at = _parse_finite_number(raw_created_at)
+    selected_line_id = value.get("selectedLineId")
+    if selected_line_id is None:
+        selected_line_id = value.get("selected_line_id")
     return {
         "id": str(value.get("id") or f"passi-ajo-group-{index + 1}"),
         "name": str(value.get("name") or f"Passiajo {index + 1}"),
         "lines": lines,
+        "selectedLineId": str(selected_line_id) if selected_line_id is not None else None,
         "createdAt": int(created_at) if created_at is not None else int(time.time() * 1000),
         "position": index,
     }
@@ -551,6 +555,7 @@ def _init_db() -> None:
               group_id TEXT NOT NULL,
               id TEXT NOT NULL,
               name TEXT NOT NULL,
+              selected_line_id TEXT,
               created_at INTEGER NOT NULL,
               position INTEGER NOT NULL,
               PRIMARY KEY (group_id, id),
@@ -642,6 +647,12 @@ def _init_db() -> None:
             except sqlite3.OperationalError:
                 # column already exists
                 pass
+
+        try:
+            conn.execute("ALTER TABLE group_passi_ajo_groups ADD COLUMN selected_line_id TEXT")
+        except sqlite3.OperationalError:
+            # column already exists
+            pass
 
 
         # Optional: index for owner lookups
@@ -849,6 +860,7 @@ class PassiAjoGroupPublic(BaseModel):
     id: str
     name: str
     lines: List[PassiLinePublic]
+    selectedLineId: Optional[str] = None
     createdAt: int
 
 
@@ -1296,7 +1308,7 @@ def _list_group_passi_ajo_groups(group_id: str) -> List[dict]:
             raise ValueError("group_not_found")
         group_rows = conn.execute(
             """
-            SELECT id, name, created_at
+            SELECT id, name, selected_line_id, created_at
             FROM group_passi_ajo_groups
             WHERE group_id = ?
             ORDER BY position, created_at, id
@@ -1333,6 +1345,7 @@ def _list_group_passi_ajo_groups(group_id: str) -> List[dict]:
             "id": row["id"],
             "name": row["name"],
             "lines": lines_by_group.get(row["id"], []),
+            "selectedLineId": row["selected_line_id"],
             "createdAt": int(row["created_at"]),
         }
         for row in group_rows
@@ -1347,13 +1360,21 @@ def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict]) -> List[d
         for group in groups:
             conn.execute(
                 """
-                INSERT INTO group_passi_ajo_groups(group_id, id, name, created_at, position)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO group_passi_ajo_groups(
+                    group_id,
+                    id,
+                    name,
+                    selected_line_id,
+                    created_at,
+                    position
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     group_id,
                     group["id"],
                     group["name"],
+                    group["selectedLineId"],
                     group["createdAt"],
                     group["position"],
                 ),
