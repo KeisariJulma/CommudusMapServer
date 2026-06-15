@@ -221,6 +221,27 @@ def _extract_passipaikat_payload(value: object) -> List[dict]:
 
 
 def _parse_coordinate_pair(value: object) -> Optional[List[float]]:
+    if isinstance(value, dict):
+        coords = value.get("coords")
+        if not isinstance(coords, list):
+            coords = value.get("coordinates")
+        if isinstance(coords, list):
+            value = coords
+        else:
+            lat_value = value.get("lat")
+            if lat_value is None:
+                lat_value = value.get("latitude")
+            lon_value = value.get("lon")
+            if lon_value is None:
+                lon_value = value.get("lng")
+            if lon_value is None:
+                lon_value = value.get("longitude")
+            lon = _parse_finite_number(lon_value)
+            lat = _parse_finite_number(lat_value)
+            if lon is None or lat is None:
+                return None
+            return [lon, lat]
+
     if not isinstance(value, list) or len(value) < 2:
         return None
     lon = _parse_finite_number(value[0])
@@ -234,6 +255,13 @@ def _normalize_passi_line_payload(value: object, index: int) -> Optional[dict]:
     if not isinstance(value, dict):
         return None
     raw_coordinates = value.get("coordinates")
+    if not isinstance(raw_coordinates, list):
+        raw_coordinates = value.get("coords")
+    if not isinstance(raw_coordinates, list):
+        raw_coordinates = value.get("points")
+    if not isinstance(raw_coordinates, list):
+        geometry = value.get("geometry")
+        raw_coordinates = geometry.get("coordinates") if isinstance(geometry, dict) else []
     if not isinstance(raw_coordinates, list):
         raw_coordinates = []
     coordinates = [
@@ -260,6 +288,12 @@ def _normalize_passi_ajo_group_payload(value: object, index: int) -> Optional[di
     if not isinstance(value, dict):
         return None
     raw_lines = value.get("lines")
+    if not isinstance(raw_lines, list):
+        raw_lines = value.get("passilinjat")
+    if not isinstance(raw_lines, list):
+        raw_lines = value.get("passi_linjat")
+    if not isinstance(raw_lines, list):
+        raw_lines = value.get("passiLines")
     if not isinstance(raw_lines, list):
         raw_lines = []
     lines = []
@@ -290,6 +324,20 @@ def _extract_passi_ajo_groups_payload(value: object) -> List[dict]:
             raw_groups = value.get("passi_ajo_groups")
         if not isinstance(raw_groups, list):
             raw_groups = value.get("passiAjoGroups")
+        if not isinstance(raw_groups, list):
+            raw_groups = value.get("passilinja_groups")
+        if not isinstance(raw_groups, list):
+            raw_groups = value.get("passilinjaGroups")
+        if not isinstance(raw_groups, list):
+            raw_lines = value.get("lines")
+            if not isinstance(raw_lines, list):
+                raw_lines = value.get("passilinjat")
+            if not isinstance(raw_lines, list):
+                raw_lines = value.get("passi_linjat")
+            if not isinstance(raw_lines, list):
+                raw_lines = value.get("passiLines")
+            if isinstance(raw_lines, list):
+                raw_groups = [{"id": "default", "name": "Passilinjat", "lines": raw_lines}]
         if not isinstance(raw_groups, list):
             raw_groups = []
     elif isinstance(value, list):
@@ -2445,9 +2493,8 @@ async def save_passi_ajo_groups(
 ):
     if not await _db_call(_group_exists, group_id):
         raise HTTPException(status_code=404, detail="group not found")
-    owner_id = await _db_call(_get_group_owner_id, group_id)
-    if owner_id != current_user_id:
-        raise HTTPException(status_code=403, detail="only group owner can save passi ajo groups")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
     try:
         payload = await request.json()
     except Exception:
@@ -2455,6 +2502,23 @@ async def save_passi_ajo_groups(
     groups = _extract_passi_ajo_groups_payload(payload)
     saved_groups = await _db_call(_replace_group_passi_ajo_groups, group_id, groups)
     return {"groups": saved_groups}
+
+
+@app.get("/groups/{group_id}/passilinjat", response_model=Dict[str, List[PassiAjoGroupPublic]])
+async def get_passilinjat(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    return await get_passi_ajo_groups(group_id, current_user_id)
+
+
+@app.put("/groups/{group_id}/passilinjat", response_model=Dict[str, List[PassiAjoGroupPublic]])
+async def save_passilinjat(
+    group_id: str,
+    request: Request,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    return await save_passi_ajo_groups(group_id, request, current_user_id)
 
 
 @app.get("/groups/{group_id}/messages", response_model=List[ChatMessagePublic])
