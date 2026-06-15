@@ -21,6 +21,7 @@ import secrets
 import smtplib
 import urllib.request
 import urllib.parse
+import urllib.error
 from email.message import EmailMessage
 
 from jose import jwt, JWTError
@@ -39,12 +40,18 @@ JWT_SECRET = os.environ.get("JWT_SECRET")  # set this in your shell
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRES_SECONDS = 60 * 60 * 24 * 365 * 10   # 7 days
 PASSWORD_RESET_EXPIRES_SECONDS = int(os.environ.get("PASSWORD_RESET_EXPIRES_SECONDS", "3600"))
-PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "http://localhost:8000")
+PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://exclusionzone.org")
 SMTP_HOST = os.environ.get("SMTP_HOST")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USERNAME or "no-reply@localhost")
+SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USERNAME or "no-reply@exclusionzone.org")
+FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY")
+FIREBASE_PASSWORD_RESET_CONTINUE_URL = os.environ.get("FIREBASE_PASSWORD_RESET_CONTINUE_URL")
+FIREBASE_PASSWORD_RESET_ANDROID_PACKAGE_NAME = os.environ.get(
+    "FIREBASE_PASSWORD_RESET_ANDROID_PACKAGE_NAME"
+)
+FIREBASE_PASSWORD_RESET_IOS_BUNDLE_ID = os.environ.get("FIREBASE_PASSWORD_RESET_IOS_BUNDLE_ID")
 FCM_SERVICE_ACCOUNT_FILE = os.environ.get("FCM_SERVICE_ACCOUNT_FILE") or os.environ.get(
     "GOOGLE_APPLICATION_CREDENTIALS"
 )
@@ -648,6 +655,45 @@ def _send_password_reset_email(email: str, token: str) -> None:
         if SMTP_USERNAME and SMTP_PASSWORD:
             smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
         smtp.send_message(message)
+
+
+def _send_firebase_password_reset_email(email: str) -> None:
+    if not FIREBASE_WEB_API_KEY:
+        raise RuntimeError("FIREBASE_WEB_API_KEY is not set")
+
+    request_payload: Dict[str, object] = {
+        "requestType": "PASSWORD_RESET",
+        "email": email,
+    }
+    if FIREBASE_PASSWORD_RESET_CONTINUE_URL:
+        request_payload["continueUrl"] = FIREBASE_PASSWORD_RESET_CONTINUE_URL
+    if FIREBASE_PASSWORD_RESET_ANDROID_PACKAGE_NAME:
+        request_payload["androidPackageName"] = FIREBASE_PASSWORD_RESET_ANDROID_PACKAGE_NAME
+    if FIREBASE_PASSWORD_RESET_IOS_BUNDLE_ID:
+        request_payload["iOSBundleId"] = FIREBASE_PASSWORD_RESET_IOS_BUNDLE_ID
+
+    request = urllib.request.Request(
+        "https://identitytoolkit.googleapis.com/v1/accounts:sendOobCode"
+        f"?key={urllib.parse.quote(FIREBASE_WEB_API_KEY, safe='')}",
+        data=json.dumps(request_payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        try:
+            error_code = json.loads(error_body)["error"]["message"]
+        except (KeyError, json.JSONDecodeError, TypeError):
+            error_code = error_body or str(e)
+        if error_code == "EMAIL_NOT_FOUND":
+            return
+        raise RuntimeError(f"Firebase password reset failed: {error_code}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Firebase password reset request failed: {e.reason}") from e
 
 
 def _reset_password_with_token(token: str, new_password: str) -> bool:
@@ -1493,6 +1539,13 @@ async def login(payload: "LoginRequest"):
 
 @app.post("/auth/forgot-password")
 async def forgot_password(payload: ForgotPasswordRequest):
+    if FIREBASE_WEB_API_KEY:
+        try:
+            await asyncio.to_thread(_send_firebase_password_reset_email, str(payload.email))
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        return {"status": "ok"}
+
     token = await _db_call(_create_password_reset_token, str(payload.email))
     if token:
         await asyncio.to_thread(_send_password_reset_email, str(payload.email), token)
