@@ -657,7 +657,7 @@ def _send_password_reset_email(email: str, token: str) -> None:
         smtp.send_message(message)
 
 
-def _send_firebase_password_reset_email(email: str) -> None:
+def _send_firebase_password_reset_email(email: str) -> str:
     if not FIREBASE_WEB_API_KEY:
         raise RuntimeError("FIREBASE_WEB_API_KEY is not set")
 
@@ -683,6 +683,7 @@ def _send_firebase_password_reset_email(email: str) -> None:
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             response.read()
+            return "sent"
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
         try:
@@ -690,7 +691,7 @@ def _send_firebase_password_reset_email(email: str) -> None:
         except (KeyError, json.JSONDecodeError, TypeError):
             error_code = error_body or str(e)
         if error_code == "EMAIL_NOT_FOUND":
-            return
+            return "email_not_found"
         raise RuntimeError(f"Firebase password reset failed: {error_code}") from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Firebase password reset request failed: {e.reason}") from e
@@ -1539,16 +1540,24 @@ async def login(payload: "LoginRequest"):
 
 @app.post("/auth/forgot-password")
 async def forgot_password(payload: ForgotPasswordRequest):
+    email = str(payload.email)
     if FIREBASE_WEB_API_KEY:
         try:
-            await asyncio.to_thread(_send_firebase_password_reset_email, str(payload.email))
+            firebase_result = await asyncio.to_thread(_send_firebase_password_reset_email, email)
         except RuntimeError as e:
             raise HTTPException(status_code=502, detail=str(e))
-        return {"status": "ok"}
 
-    token = await _db_call(_create_password_reset_token, str(payload.email))
+        if firebase_result == "sent":
+            print(f"Firebase password reset email requested for {email}")
+            return {"status": "ok"}
+
+        print(f"Firebase password reset skipped for {email}: email not found in Firebase Auth")
+
+    token = await _db_call(_create_password_reset_token, email)
     if token:
-        await asyncio.to_thread(_send_password_reset_email, str(payload.email), token)
+        await asyncio.to_thread(_send_password_reset_email, email, token)
+    else:
+        print(f"Password reset skipped for {email}: email not found in local users")
     return {"status": "ok"}
 
 
