@@ -638,8 +638,7 @@ def _build_password_reset_url(token: str) -> str:
 def _send_password_reset_email(email: str, token: str) -> None:
     reset_url = _build_password_reset_url(token)
     if not SMTP_HOST:
-        print(f"Password reset link for {email}: {reset_url}")
-        return
+        raise RuntimeError("SMTP_HOST is not set")
 
     message = EmailMessage()
     message["Subject"] = "Reset your Commudus password"
@@ -1555,7 +1554,10 @@ async def forgot_password(payload: ForgotPasswordRequest):
 
     token = await _db_call(_create_password_reset_token, email)
     if token:
-        await asyncio.to_thread(_send_password_reset_email, email, token)
+        try:
+            await asyncio.to_thread(_send_password_reset_email, email, token)
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
     else:
         print(f"Password reset skipped for {email}: email not found in local users")
     return {"status": "ok"}
