@@ -17,6 +17,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import secrets
 import smtplib
 import urllib.request
@@ -118,6 +119,105 @@ def _parse_optional_float(value: object) -> Optional[float]:
         except ValueError:
             return None
     return None
+
+
+def _parse_finite_number(value: object) -> Optional[float]:
+    number_value = _parse_optional_float(value)
+    if number_value is None:
+        return None
+    if not math.isfinite(number_value):
+        return None
+    return number_value
+
+
+def _parse_passipaikka_coords(value: Dict[str, object]) -> Optional[tuple[float, float]]:
+    coords = value.get("coords")
+    if isinstance(coords, list) and len(coords) >= 2:
+        lon = _parse_finite_number(coords[0])
+        lat = _parse_finite_number(coords[1])
+        if lon is not None and lat is not None:
+            return lon, lat
+
+    coordinates = value.get("coordinates")
+    if isinstance(coordinates, list) and len(coordinates) >= 2:
+        lon = _parse_finite_number(coordinates[0])
+        lat = _parse_finite_number(coordinates[1])
+        if lon is not None and lat is not None:
+            return lon, lat
+
+    lat_value = value.get("lat")
+    if lat_value is None:
+        lat_value = value.get("latitude")
+    lon_value = value.get("lon")
+    if lon_value is None:
+        lon_value = value.get("lng")
+    if lon_value is None:
+        lon_value = value.get("longitude")
+    lat = _parse_finite_number(lat_value)
+    lon = _parse_finite_number(lon_value)
+    if lat is None or lon is None:
+        return None
+    return lon, lat
+
+
+def _normalize_passipaikka_payload(value: object, index: int) -> Optional[dict]:
+    if not isinstance(value, dict):
+        return None
+    coords = _parse_passipaikka_coords(value)
+    if coords is None:
+        return None
+
+    raw_number = value.get("number")
+    if raw_number is None:
+        raw_number = value.get("numero")
+    if raw_number is None:
+        raw_number = value.get("label")
+    number_value = _parse_finite_number(raw_number)
+    lon, lat = coords
+    return {
+        "id": str(value.get("id") or value.get("passipaikka_id") or f"passipaikka-{index + 1}"),
+        "number": int(number_value) if number_value is not None else index + 1,
+        "lon": lon,
+        "lat": lat,
+        "position": index,
+    }
+
+
+def _extract_passipaikat_payload(value: object) -> List[dict]:
+    if isinstance(value, dict):
+        raw_points = value.get("points")
+        if not isinstance(raw_points, list):
+            raw_points = value.get("passipaikat")
+        if not isinstance(raw_points, list):
+            raw_points = value.get("stands")
+        if not isinstance(raw_points, list):
+            lists = value.get("lists") or value.get("passipaikka_lists")
+            if isinstance(lists, list) and lists:
+                first_list = lists[0]
+                if isinstance(first_list, dict):
+                    raw_points = first_list.get("points")
+                    if not isinstance(raw_points, list):
+                        raw_points = first_list.get("passipaikat")
+                    if not isinstance(raw_points, list):
+                        raw_points = first_list.get("stands")
+                else:
+                    raw_points = []
+        if not isinstance(raw_points, list):
+            raw_points = []
+    elif isinstance(value, list):
+        raw_points = value
+    else:
+        raw_points = []
+
+    points = []
+    seen_ids = set()
+    for index, raw_point in enumerate(raw_points):
+        point = _normalize_passipaikka_payload(raw_point, index)
+        if not point or point["id"] in seen_ids:
+            continue
+        seen_ids.add(point["id"])
+        points.append(point)
+    return points
 
 
 def _normalize_phone(value: Optional[str]) -> Optional[str]:
@@ -299,6 +399,17 @@ def _init_db() -> None:
               FOREIGN KEY (message_id) REFERENCES group_messages(id) ON DELETE CASCADE,
               FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS group_passipaikat (
+              group_id TEXT NOT NULL,
+              id TEXT NOT NULL,
+              number INTEGER NOT NULL,
+              lon REAL NOT NULL,
+              lat REAL NOT NULL,
+              position INTEGER NOT NULL,
+              PRIMARY KEY (group_id, id),
+              FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
+            );
             """
         )
 
@@ -408,6 +519,14 @@ def _init_db() -> None:
         try:
             conn.execute(
                 "CREATE INDEX idx_password_reset_tokens_user ON password_reset_tokens(user_id)"
+            )
+        except sqlite3.OperationalError:
+            # index already exists
+            pass
+
+        try:
+            conn.execute(
+                "CREATE INDEX idx_group_passipaikat_group_position ON group_passipaikat(group_id, position)"
             )
         except sqlite3.OperationalError:
             # index already exists
@@ -530,6 +649,18 @@ class GroupPublic(BaseModel):
     id: str
     name: Optional[str] = None
     owner_user_id: Optional[str] = None
+
+
+class PassipaikkaPublic(BaseModel):
+    id: str
+    number: int
+    coords: List[float]
+
+
+class PassipaikkaListPublic(BaseModel):
+    id: str
+    name: str
+    points: List[PassipaikkaPublic]
 
 
 class ShareUpdate(BaseModel):
@@ -883,6 +1014,73 @@ def _list_group_ids() -> List[str]:
     with _get_conn() as conn:
         rows = conn.execute("SELECT id FROM groups ORDER BY id").fetchall()
         return [r["id"] for r in rows]
+
+
+def _format_passipaikka_list(group_id: str, group_name: Optional[str], rows: List[sqlite3.Row]) -> dict:
+    return {
+        "id": group_id,
+        "name": group_name or "Passipaikat",
+        "points": [
+            {
+                "id": r["id"],
+                "number": int(r["number"]),
+                "coords": [float(r["lon"]), float(r["lat"])],
+            }
+            for r in rows
+        ],
+    }
+
+
+def _get_group_passipaikka_list(group_id: str) -> dict:
+    with _get_conn() as conn:
+        group = conn.execute("SELECT id, name FROM groups WHERE id = ?", (group_id,)).fetchone()
+        if not group:
+            raise ValueError("group_not_found")
+        rows = conn.execute(
+            """
+            SELECT id, number, lon, lat
+            FROM group_passipaikat
+            WHERE group_id = ?
+            ORDER BY position, number, id
+            """,
+            (group_id,),
+        ).fetchall()
+        return _format_passipaikka_list(group["id"], group["name"], rows)
+
+
+def _replace_group_passipaikat(group_id: str, points: List[dict]) -> dict:
+    with _get_conn() as conn:
+        group = conn.execute("SELECT id, name FROM groups WHERE id = ?", (group_id,)).fetchone()
+        if not group:
+            raise ValueError("group_not_found")
+        conn.execute("DELETE FROM group_passipaikat WHERE group_id = ?", (group_id,))
+        conn.executemany(
+            """
+            INSERT INTO group_passipaikat(group_id, id, number, lon, lat, position)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    group_id,
+                    point["id"],
+                    point["number"],
+                    point["lon"],
+                    point["lat"],
+                    point["position"],
+                )
+                for point in points
+            ],
+        )
+        rows = conn.execute(
+            """
+            SELECT id, number, lon, lat
+            FROM group_passipaikat
+            WHERE group_id = ?
+            ORDER BY position, number, id
+            """,
+            (group_id,),
+        ).fetchall()
+        return _format_passipaikka_list(group["id"], group["name"], rows)
 
 
 def _add_member(group_id: str, user_id: str) -> None:
@@ -1936,6 +2134,38 @@ async def list_group_members(
 
     members = await _db_call(_list_members, group_id)
     return {"group_id": group_id, "members": members}
+
+
+@app.get("/groups/{group_id}/passipaikat", response_model=Dict[str, List[PassipaikkaListPublic]])
+async def get_group_passipaikat(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+    passipaikka_list = await _db_call(_get_group_passipaikka_list, group_id)
+    return {"lists": [passipaikka_list]}
+
+
+@app.put("/groups/{group_id}/passipaikat", response_model=Dict[str, List[PassipaikkaListPublic]])
+async def sync_group_passipaikat(
+    group_id: str,
+    request: Request,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json body")
+    points = _extract_passipaikat_payload(payload)
+    passipaikka_list = await _db_call(_replace_group_passipaikat, group_id, points)
+    return {"lists": [passipaikka_list]}
 
 
 @app.get("/groups/{group_id}/messages", response_model=List[ChatMessagePublic])
