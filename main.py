@@ -802,6 +802,7 @@ class UserCreate(BaseModel):
     email: Optional[EmailStr] = None
     password: str
     phone: Optional[str] = None
+    phone_number: Optional[str] = None
 
 
 class UserPublic(BaseModel):
@@ -813,6 +814,7 @@ class UserPublic(BaseModel):
 
 class UserPhoneUpdate(BaseModel):
     phone: Optional[str] = None
+    phone_number: Optional[str] = None
 
 
 class UserUpdate(BaseModel):
@@ -841,6 +843,7 @@ class LoginRequest(BaseModel):
     identifier: Optional[str] = None
     email: Optional[str] = None
     phone: Optional[str] = None
+    phone_number: Optional[str] = None
     password: str
 
 
@@ -967,7 +970,9 @@ def _create_user(
 
 def _get_user_by_email(email: str) -> Optional[sqlite3.Row]:
     with _get_conn() as conn:
-        return conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        return conn.execute(
+            "SELECT * FROM users WHERE LOWER(email) = ?", (email.strip().lower(),)
+        ).fetchone()
 
 
 def _hash_reset_token(token: str) -> str:
@@ -2038,7 +2043,7 @@ async def update_user(
         raise HTTPException(status_code=400, detail="name required")
     email_value = UNSET
     if payload.email is not None:
-        email_value = str(payload.email).strip()
+        email_value = str(payload.email).strip().lower()
         if not email_value:
             raise HTTPException(status_code=400, detail="email required")
     phone_value = UNSET
@@ -2047,9 +2052,11 @@ async def update_user(
         if not trimmed_phone:
             phone_value = None
         else:
-            phone_value = _normalize_phone(trimmed_phone)
+            phone_value = _normalize_e164_phone(trimmed_phone)
             if not phone_value:
-                raise HTTPException(status_code=400, detail="phone required")
+                raise HTTPException(
+                    status_code=400, detail="phone must use international E.164 format"
+                )
     try:
         row = await _db_call(_update_user, user_id, name_value, email_value, phone_value)
     except ValueError as exc:
@@ -2079,13 +2086,14 @@ async def update_user_phone(
 ):
     if current_user_id != user_id:
         raise HTTPException(status_code=403, detail="cannot update another user")
-    if payload.phone is None:
+    submitted_phone = payload.phone_number if payload.phone_number is not None else payload.phone
+    if submitted_phone is None:
         raise HTTPException(status_code=400, detail="phone required")
-    trimmed_phone = payload.phone.strip()
+    trimmed_phone = submitted_phone.strip()
     if trimmed_phone:
-        phone_value = _normalize_phone(trimmed_phone)
+        phone_value = _normalize_e164_phone(trimmed_phone)
         if not phone_value:
-            raise HTTPException(status_code=400, detail="phone required")
+            raise HTTPException(status_code=400, detail="phone must use international E.164 format")
     else:
         phone_value = None
     try:
@@ -2128,12 +2136,13 @@ async def register_push_token(
 
 @app.post("/users", response_model=UserPublic)
 async def create_user(payload: UserCreate):
-    email_value = str(payload.email) if payload.email is not None else None
+    email_value = str(payload.email).strip().lower() if payload.email is not None else None
+    submitted_phone = payload.phone_number if payload.phone_number is not None else payload.phone
     phone_value = None
-    if payload.phone is not None:
-        phone_value = _normalize_phone(payload.phone)
-        if payload.phone.strip() and not phone_value:
-            raise HTTPException(status_code=400, detail="phone required")
+    if submitted_phone is not None:
+        phone_value = _normalize_e164_phone(submitted_phone)
+        if submitted_phone.strip() and not phone_value:
+            raise HTTPException(status_code=400, detail="phone must use international E.164 format")
     if not email_value and not phone_value:
         raise HTTPException(status_code=400, detail="email or phone required")
     if email_value:
@@ -2156,15 +2165,21 @@ async def create_user(payload: UserCreate):
 
 @app.post("/auth/login")
 async def login(payload: "LoginRequest"):
-    identifier = (payload.identifier or payload.email or payload.phone or "").strip()
+    identifier = (
+        payload.phone_number
+        or payload.phone
+        or payload.email
+        or payload.identifier
+        or ""
+    ).strip()
     if not identifier:
         raise HTTPException(status_code=400, detail="identifier required")
     if "@" in identifier:
-        row = await _db_call(_get_user_by_email, identifier)
+        row = await _db_call(_get_user_by_email, identifier.lower())
     else:
-        phone_value = _normalize_phone(identifier)
+        phone_value = _normalize_e164_phone(identifier)
         if not phone_value:
-            raise HTTPException(status_code=400, detail="phone required")
+            raise HTTPException(status_code=400, detail="phone must use international E.164 format")
         row = await _db_call(_get_user_by_phone, phone_value)
     if not row or not _verify_password(payload.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="invalid credentials")
