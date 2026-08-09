@@ -1,0 +1,30 @@
+[Unit]
+Description=Commudus Map Server
+Documentation=file:///mnt/secret/servers/CommudusMapServer/main.py
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=frankenstein
+Group=frankenstein
+WorkingDirectory=/mnt/secret/servers/CommudusMapServer
+
+Environment=PORT=5656
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/home/frankenstein/.cache/pypoetry/virtualenvs/commudusmapserver-4IKSBiaG-py3.14/bin/python /mnt/secret/servers/CommudusMapServer/main.py
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGINT
+
+# Basic service hardening. The application still needs to write its SQLite
+# database and uploaded files inside the project directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/mnt/secret/servers/CommudusMapServer
+
+[Install]
+WantedBy=multi-user.target
