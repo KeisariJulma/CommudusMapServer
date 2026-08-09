@@ -801,6 +801,16 @@ class UserUpdate(BaseModel):
     phone: Optional[str] = None
 
 
+class ContactDiscoveryRequest(BaseModel):
+    hashes: List[str]
+
+
+class ContactDiscoveryMatch(BaseModel):
+    id: str
+    name: str
+    matched_hashes: List[str]
+
+
 class LoginRequest(BaseModel):
     identifier: Optional[str] = None
     email: Optional[str] = None
@@ -1066,6 +1076,42 @@ def _get_user_by_phone(phone: str) -> Optional[sqlite3.Row]:
 def _get_user_by_id(user_id: str) -> Optional[sqlite3.Row]:
     with _get_conn() as conn:
         return conn.execute("SELECT id, name, email, phone FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
+def _contact_identifier_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _discover_users_by_contact_hashes(
+    contact_hashes: set[str], current_user_id: str
+) -> List[dict]:
+    matches = []
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, name, email, phone FROM users WHERE id != ?",
+            (current_user_id,),
+        ).fetchall()
+
+    for row in rows:
+        identifiers = []
+        if row["email"]:
+            identifiers.append(str(row["email"]).strip().lower())
+        if row["phone"]:
+            normalized_phone = _normalize_phone(str(row["phone"]))
+            if normalized_phone:
+                identifiers.append(normalized_phone)
+        matched_hashes = sorted(
+            {
+                identifier_hash
+                for identifier_hash in map(_contact_identifier_hash, identifiers)
+                if identifier_hash in contact_hashes
+            }
+        )
+        if matched_hashes:
+            matches.append(
+                {"id": row["id"], "name": row["name"], "matched_hashes": matched_hashes}
+            )
+    return matches
 
 
 def _update_user_phone(user_id: str, phone: Optional[str]) -> Optional[sqlite3.Row]:
@@ -1907,6 +1953,28 @@ async def _send_fcm_push_async(tokens: List[str], title: str, body: str, data: d
 # -----------------------
 # Routes: Users + Auth
 # -----------------------
+@app.post("/users/contact-discovery", response_model=List[ContactDiscoveryMatch])
+async def discover_users_by_contacts(
+    payload: ContactDiscoveryRequest,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if len(payload.hashes) > 1000:
+        raise HTTPException(status_code=400, detail="at most 1000 contact hashes are allowed")
+
+    contact_hashes = set()
+    for value in payload.hashes:
+        normalized_hash = value.strip().lower()
+        if len(normalized_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized_hash
+        ):
+            raise HTTPException(status_code=400, detail="contact hashes must be SHA-256 hex strings")
+        contact_hashes.add(normalized_hash)
+
+    if not contact_hashes:
+        return []
+    return await _db_call(_discover_users_by_contact_hashes, contact_hashes, current_user_id)
+
+
 @app.get("/users/{user_id}", response_model=UserPublic)
 async def get_user(user_id: str):
     row = await _db_call(_get_user_by_id, user_id)
