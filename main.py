@@ -377,6 +377,16 @@ def _normalize_phone(value: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
+def _normalize_e164_phone(value: Optional[str]) -> Optional[str]:
+    normalized = _normalize_phone(value)
+    if not normalized or not normalized.startswith("+"):
+        return None
+    digits = normalized[1:]
+    if not digits.isdigit() or not 8 <= len(digits) <= 15 or digits.startswith("0"):
+        return None
+    return normalized
+
+
 UNSET = object()
 
 
@@ -462,6 +472,7 @@ def _init_db() -> None:
               name TEXT NOT NULL,
               email TEXT UNIQUE,
               phone TEXT,
+              discoverable INTEGER NOT NULL DEFAULT 1,
               password_hash TEXT NOT NULL,
               created_at REAL NOT NULL
             );
@@ -598,6 +609,14 @@ def _init_db() -> None:
             # column already exists
             pass
 
+        # Migration: allow users to opt out of contact discovery.
+        try:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN discoverable INTEGER NOT NULL DEFAULT 1"
+            )
+        except sqlite3.OperationalError:
+            pass
+
         # Migration: allow NULL email and ensure unique phone
         try:
             columns = conn.execute("PRAGMA table_info(users)").fetchall()
@@ -611,12 +630,13 @@ def _init_db() -> None:
                         "name TEXT NOT NULL, "
                         "email TEXT UNIQUE, "
                         "phone TEXT UNIQUE, "
+                        "discoverable INTEGER NOT NULL DEFAULT 1, "
                         "password_hash TEXT NOT NULL, "
                         "created_at REAL NOT NULL)"
                     )
                     conn.execute(
-                        "INSERT INTO users_new(id, name, email, phone, password_hash, created_at) "
-                        "SELECT id, name, email, phone, password_hash, created_at FROM users"
+                        "INSERT INTO users_new(id, name, email, phone, discoverable, password_hash, created_at) "
+                        "SELECT id, name, email, phone, discoverable, password_hash, created_at FROM users"
                     )
                     conn.execute("DROP TABLE users")
                     conn.execute("ALTER TABLE users_new RENAME TO users")
@@ -802,13 +822,19 @@ class UserUpdate(BaseModel):
 
 
 class ContactDiscoveryRequest(BaseModel):
-    hashes: List[str]
+    phone_numbers: Optional[List[str]] = None
+    # Accepted for compatibility with clients that use the shorter field name.
+    phones: Optional[List[str]] = None
 
 
 class ContactDiscoveryMatch(BaseModel):
     id: str
     name: str
-    matched_hashes: List[str]
+    matched_phone_hashes: List[str]
+
+
+class UserDiscoverabilityUpdate(BaseModel):
+    discoverable: bool
 
 
 class LoginRequest(BaseModel):
@@ -1082,36 +1108,36 @@ def _contact_identifier_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _discover_users_by_contact_hashes(
-    contact_hashes: set[str], current_user_id: str
+def _discover_users_by_phone_numbers(
+    phone_numbers: set[str], current_user_id: str
 ) -> List[dict]:
     matches = []
     with _get_conn() as conn:
         rows = conn.execute(
-            "SELECT id, name, email, phone FROM users WHERE id != ?",
+            "SELECT id, name, phone FROM users WHERE id != ? AND discoverable = 1",
             (current_user_id,),
         ).fetchall()
 
     for row in rows:
-        identifiers = []
-        if row["email"]:
-            identifiers.append(str(row["email"]).strip().lower())
-        if row["phone"]:
-            normalized_phone = _normalize_phone(str(row["phone"]))
-            if normalized_phone:
-                identifiers.append(normalized_phone)
-        matched_hashes = sorted(
-            {
-                identifier_hash
-                for identifier_hash in map(_contact_identifier_hash, identifiers)
-                if identifier_hash in contact_hashes
-            }
-        )
-        if matched_hashes:
+        normalized_phone = _normalize_e164_phone(row["phone"])
+        if normalized_phone and normalized_phone in phone_numbers:
             matches.append(
-                {"id": row["id"], "name": row["name"], "matched_hashes": matched_hashes}
+                {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "matched_phone_hashes": [_contact_identifier_hash(normalized_phone)],
+                }
             )
     return matches
+
+
+def _set_user_discoverability(user_id: str, discoverable: bool) -> bool:
+    with _get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE users SET discoverable = ? WHERE id = ?",
+            (1 if discoverable else 0, user_id),
+        )
+        return cursor.rowcount > 0
 
 
 def _update_user_phone(user_id: str, phone: Optional[str]) -> Optional[sqlite3.Row]:
@@ -1958,21 +1984,37 @@ async def discover_users_by_contacts(
     payload: ContactDiscoveryRequest,
     current_user_id: str = Depends(get_current_user_id),
 ):
-    if len(payload.hashes) > 1000:
-        raise HTTPException(status_code=400, detail="at most 1000 contact hashes are allowed")
+    submitted_numbers = (payload.phone_numbers or []) + (payload.phones or [])
+    if len(submitted_numbers) > 1000:
+        raise HTTPException(status_code=400, detail="at most 1000 phone numbers are allowed")
 
-    contact_hashes = set()
-    for value in payload.hashes:
-        normalized_hash = value.strip().lower()
-        if len(normalized_hash) != 64 or any(
-            character not in "0123456789abcdef" for character in normalized_hash
-        ):
-            raise HTTPException(status_code=400, detail="contact hashes must be SHA-256 hex strings")
-        contact_hashes.add(normalized_hash)
+    phone_numbers = set()
+    for value in submitted_numbers:
+        normalized_phone = _normalize_e164_phone(value)
+        if not normalized_phone:
+            raise HTTPException(
+                status_code=400,
+                detail="phone numbers must use international E.164 format",
+            )
+        phone_numbers.add(normalized_phone)
 
-    if not contact_hashes:
+    if not phone_numbers:
         return []
-    return await _db_call(_discover_users_by_contact_hashes, contact_hashes, current_user_id)
+    return await _db_call(_discover_users_by_phone_numbers, phone_numbers, current_user_id)
+
+
+@app.put("/users/{user_id}/discoverability")
+async def update_user_discoverability(
+    user_id: str,
+    payload: UserDiscoverabilityUpdate,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if current_user_id != user_id:
+        raise HTTPException(status_code=403, detail="cannot update another user")
+    updated = await _db_call(_set_user_discoverability, user_id, payload.discoverable)
+    if not updated:
+        raise HTTPException(status_code=404, detail="user not found")
+    return {"status": "ok", "discoverable": payload.discoverable}
 
 
 @app.get("/users/{user_id}", response_model=UserPublic)
