@@ -611,6 +611,20 @@ def _init_db() -> None:
             # column already exists
             pass
 
+        # Owners are always admins. This also backfills groups created before
+        # the group_admins table was introduced. It must run after the legacy
+        # owner_user_id migration above.
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO group_admins(group_id, user_id)
+            SELECT g.id, g.owner_user_id
+            FROM groups g
+            JOIN group_members gm
+              ON gm.group_id = g.id AND gm.user_id = g.owner_user_id
+            WHERE g.owner_user_id IS NOT NULL AND g.owner_user_id != ''
+            """
+        )
+
         # Migration: add phone to users
         try:
             conn.execute("ALTER TABLE users ADD COLUMN phone TEXT")
@@ -1295,6 +1309,14 @@ def _set_group_owner(group_id: str, owner_user_id: str) -> None:
             "UPDATE groups SET owner_user_id = ? WHERE id = ? AND (owner_user_id IS NULL OR owner_user_id = '')",
             (owner_user_id, group_id),
         )
+        conn.execute(
+            "INSERT OR IGNORE INTO group_members(group_id, user_id) VALUES (?, ?)",
+            (group_id, owner_user_id),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO group_admins(group_id, user_id) VALUES (?, ?)",
+            (group_id, owner_user_id),
+        )
 
 
 
@@ -1325,6 +1347,12 @@ def _create_group_with_owner(group_id: str, owner_user_id: str, name: Optional[s
         # ensure owner is a member of the group
         conn.execute(
             "INSERT OR IGNORE INTO group_members(group_id, user_id) VALUES (?, ?)",
+            (group_id, owner_user_id),
+        )
+
+        # The creator is both the owner and an explicitly stored admin.
+        conn.execute(
+            "INSERT OR IGNORE INTO group_admins(group_id, user_id) VALUES (?, ?)",
             (group_id, owner_user_id),
         )
 
