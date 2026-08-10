@@ -499,6 +499,11 @@ def _init_db() -> None:
               name TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+              name TEXT PRIMARY KEY,
+              applied_at REAL NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS group_members (
               group_id TEXT NOT NULL,
               user_id  TEXT NOT NULL,
@@ -627,19 +632,28 @@ def _init_db() -> None:
             # column already exists
             pass
 
-        # Owners are always admins. This also backfills groups created before
-        # the group_admins table was introduced. It must run after the legacy
-        # owner_user_id migration above.
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO group_admins(group_id, user_id)
-            SELECT g.id, g.owner_user_id
-            FROM groups g
-            JOIN group_members gm
-              ON gm.group_id = g.id AND gm.user_id = g.owner_user_id
-            WHERE g.owner_user_id IS NOT NULL AND g.owner_user_id != ''
-            """
-        )
+        # Backfill existing owners once. Re-running this on every startup would
+        # restore an admin privilege that an owner intentionally removed.
+        owner_admin_migration = "backfill_group_owner_admin_v1"
+        already_applied = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?",
+            (owner_admin_migration,),
+        ).fetchone()
+        if not already_applied:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO group_admins(group_id, user_id)
+                SELECT g.id, g.owner_user_id
+                FROM groups g
+                JOIN group_members gm
+                  ON gm.group_id = g.id AND gm.user_id = g.owner_user_id
+                WHERE g.owner_user_id IS NOT NULL AND g.owner_user_id != ''
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
+                (owner_admin_migration, time.time()),
+            )
 
         # Migration: add phone to users
         try:
@@ -1264,36 +1278,20 @@ def _get_group_name(group_id: str) -> Optional[str]:
         return row["name"]
 
 
-def _list_admins(group_id: str, include_owner: bool = True) -> List[str]:
+def _list_admins(group_id: str) -> List[str]:
     with _get_conn() as conn:
         rows = conn.execute(
             "SELECT user_id FROM group_admins WHERE group_id = ? ORDER BY user_id",
             (group_id,),
         ).fetchall()
-        admin_ids = [row["user_id"] for row in rows]
-        if include_owner:
-            row = conn.execute(
-                "SELECT owner_user_id FROM groups WHERE id = ?", (group_id,)
-            ).fetchone()
-            if row and row["owner_user_id"] and row["owner_user_id"] not in admin_ids:
-                admin_ids.insert(0, row["owner_user_id"])
-        return admin_ids
+        return [row["user_id"] for row in rows]
 
 
 def _is_group_admin(group_id: str, user_id: str) -> bool:
     with _get_conn() as conn:
         row = conn.execute(
-            """
-            SELECT 1
-            FROM groups g
-            WHERE g.id = ? AND (
-              g.owner_user_id = ? OR EXISTS (
-                SELECT 1 FROM group_admins ga
-                WHERE ga.group_id = g.id AND ga.user_id = ?
-              )
-            )
-            """,
-            (group_id, user_id, user_id),
+            "SELECT 1 FROM group_admins WHERE group_id = ? AND user_id = ?",
+            (group_id, user_id),
         ).fetchone()
         return row is not None
 
@@ -1415,10 +1413,9 @@ def _list_user_groups(user_id: str) -> List[dict]:
             {
                 "id": r["id"], "name": r["name"],
                 "owner_user_id": r["owner_user_id"],
-                "admin_user_ids": list(dict.fromkeys(
-                    ([r["owner_user_id"]] if r["owner_user_id"] else [])
-                    + (r["admin_user_ids"].split(",") if r["admin_user_ids"] else [])
-                )),
+                "admin_user_ids": (
+                    r["admin_user_ids"].split(",") if r["admin_user_ids"] else []
+                ),
             }
             for r in rows
         ]
@@ -1709,12 +1706,10 @@ def _list_members_with_names(group_id: str) -> List[dict]:
         rows = conn.execute(
             """
             SELECT u.id AS id, u.name AS name,
-                   CASE WHEN g.owner_user_id = u.id THEN 'admin'
-                        WHEN ga.user_id IS NOT NULL THEN 'admin'
+                   CASE WHEN ga.user_id IS NOT NULL THEN 'admin'
                         ELSE 'member' END AS role
             FROM group_members gm
             JOIN users u ON u.id = gm.user_id
-            JOIN groups g ON g.id = gm.group_id
             LEFT JOIN group_admins ga
               ON ga.group_id = gm.group_id AND ga.user_id = gm.user_id
             WHERE gm.group_id = ?
@@ -2715,7 +2710,9 @@ async def add_group_admin(
     owner_id = await _db_call(_get_group_owner_id, group_id)
     if not owner_id:
         raise HTTPException(status_code=404, detail="group not found")
-    if not await _db_call(_is_group_admin, group_id, current_user_id):
+    if current_user_id != owner_id and not await _db_call(
+        _is_group_admin, group_id, current_user_id
+    ):
         raise HTTPException(status_code=403, detail="only group admins can add admins")
     if not await _db_call(_is_member, group_id, user_id):
         raise HTTPException(status_code=400, detail="admin must be a group member")
@@ -2734,8 +2731,6 @@ async def remove_group_admin(
         raise HTTPException(status_code=404, detail="group not found")
     if current_user_id != owner_id:
         raise HTTPException(status_code=403, detail="only group owner can remove admins")
-    if user_id == owner_id:
-        raise HTTPException(status_code=400, detail="group owner cannot be demoted")
     removed = await _db_call(_remove_group_admin, group_id, user_id)
     if removed == 0:
         raise HTTPException(status_code=404, detail="admin not found")
