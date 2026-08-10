@@ -1693,7 +1693,7 @@ def _list_members_with_names(group_id: str) -> List[dict]:
         rows = conn.execute(
             """
             SELECT u.id AS id, u.name AS name,
-                   CASE WHEN g.owner_user_id = u.id THEN 'owner'
+                   CASE WHEN g.owner_user_id = u.id THEN 'admin'
                         WHEN ga.user_id IS NOT NULL THEN 'admin'
                         ELSE 'member' END AS role
             FROM group_members gm
