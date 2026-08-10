@@ -2699,8 +2699,8 @@ async def add_group_admin(
     owner_id = await _db_call(_get_group_owner_id, group_id)
     if not owner_id:
         raise HTTPException(status_code=404, detail="group not found")
-    if current_user_id != owner_id:
-        raise HTTPException(status_code=403, detail="only group owner can add admins")
+    if not await _db_call(_is_group_admin, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="only group admins can add admins")
     if not await _db_call(_is_member, group_id, user_id):
         raise HTTPException(status_code=400, detail="admin must be a group member")
     await _db_call(_add_group_admin, group_id, user_id)
