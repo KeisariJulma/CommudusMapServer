@@ -361,6 +361,22 @@ def _extract_passi_ajo_groups_payload(value: object) -> List[dict]:
     return groups
 
 
+def _extract_passilinjat_sync_group_id(value: object) -> Optional[str]:
+    if not isinstance(value, dict):
+        return None
+    raw_group_id = value.get("group_id")
+    if raw_group_id is None:
+        raw_group_id = value.get("groupId")
+    if raw_group_id is None:
+        raw_group_id = value.get("sync_group_id")
+    if raw_group_id is None:
+        raw_group_id = value.get("syncGroupId")
+    if raw_group_id is None:
+        return None
+    group_id = str(raw_group_id).strip()
+    return group_id or None
+
+
 def _normalize_phone(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -2825,6 +2841,65 @@ async def save_passi_ajo_groups(
     groups = _extract_passi_ajo_groups_payload(payload)
     saved_groups = await _db_call(_replace_group_passi_ajo_groups, group_id, groups)
     return {"groups": saved_groups}
+
+
+@app.get("/passilinjat/groups")
+async def list_passilinjat_sync_groups(
+    current_user_id: str = Depends(get_current_user_id),
+):
+    """Return the groups the user can choose as a Passilinjat sync target."""
+    groups = await _db_call(_list_user_groups, current_user_id)
+    return {"groups": groups}
+
+
+@app.get("/passilinjat")
+async def get_selected_group_passilinjat(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    """Read Passilinjat from the group selected by the client."""
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+    groups = await _db_call(_list_group_passi_ajo_groups, group_id)
+    group_name = await _db_call(_get_group_name, group_id)
+    return {"group_id": group_id, "group_name": group_name, "groups": groups}
+
+
+@app.put("/passilinjat")
+async def save_selected_group_passilinjat(
+    request: Request,
+    group_id: Optional[str] = None,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    """Sync Passilinjat to the group selected in the query or JSON body."""
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid json body")
+
+    body_group_id = _extract_passilinjat_sync_group_id(payload)
+    if group_id and body_group_id and group_id != body_group_id:
+        raise HTTPException(status_code=400, detail="conflicting group_id values")
+    selected_group_id = group_id or body_group_id
+    if not selected_group_id:
+        raise HTTPException(status_code=400, detail="group_id required")
+    if not await _db_call(_group_exists, selected_group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, selected_group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+
+    groups = _extract_passi_ajo_groups_payload(payload)
+    saved_groups = await _db_call(
+        _replace_group_passi_ajo_groups, selected_group_id, groups
+    )
+    group_name = await _db_call(_get_group_name, selected_group_id)
+    return {
+        "group_id": selected_group_id,
+        "group_name": group_name,
+        "groups": saved_groups,
+    }
 
 
 @app.get("/groups/{group_id}/passilinjat", response_model=Dict[str, List[PassiAjoGroupPublic]])
