@@ -3,7 +3,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from typing import Dict, List, Optional
 import uvicorn
 import time
@@ -490,6 +490,14 @@ def _init_db() -> None:
               FOREIGN KEY (user_id)  REFERENCES users(id)  ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS group_admins (
+              group_id TEXT NOT NULL,
+              user_id  TEXT NOT NULL,
+              PRIMARY KEY (group_id, user_id),
+              FOREIGN KEY (group_id, user_id)
+                REFERENCES group_members(group_id, user_id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS group_join_requests (
               group_id TEXT NOT NULL,
               user_id  TEXT NOT NULL,
@@ -874,6 +882,7 @@ class GroupPublic(BaseModel):
     id: str
     name: Optional[str] = None
     owner_user_id: Optional[str] = None
+    admin_user_ids: List[str] = Field(default_factory=list)
 
 
 class PassipaikkaPublic(BaseModel):
@@ -1223,6 +1232,62 @@ def _get_group_name(group_id: str) -> Optional[str]:
             return None
         return row["name"]
 
+
+def _list_admins(group_id: str, include_owner: bool = True) -> List[str]:
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM group_admins WHERE group_id = ? ORDER BY user_id",
+            (group_id,),
+        ).fetchall()
+        admin_ids = [row["user_id"] for row in rows]
+        if include_owner:
+            row = conn.execute(
+                "SELECT owner_user_id FROM groups WHERE id = ?", (group_id,)
+            ).fetchone()
+            if row and row["owner_user_id"] and row["owner_user_id"] not in admin_ids:
+                admin_ids.insert(0, row["owner_user_id"])
+        return admin_ids
+
+
+def _is_group_admin(group_id: str, user_id: str) -> bool:
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM groups g
+            WHERE g.id = ? AND (
+              g.owner_user_id = ? OR EXISTS (
+                SELECT 1 FROM group_admins ga
+                WHERE ga.group_id = g.id AND ga.user_id = ?
+              )
+            )
+            """,
+            (group_id, user_id, user_id),
+        ).fetchone()
+        return row is not None
+
+
+def _add_group_admin(group_id: str, user_id: str) -> None:
+    with _get_conn() as conn:
+        if not conn.execute(
+            "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?",
+            (group_id, user_id),
+        ).fetchone():
+            raise ValueError("not_a_member")
+        conn.execute(
+            "INSERT OR IGNORE INTO group_admins(group_id, user_id) VALUES (?, ?)",
+            (group_id, user_id),
+        )
+
+
+def _remove_group_admin(group_id: str, user_id: str) -> int:
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM group_admins WHERE group_id = ? AND user_id = ?",
+            (group_id, user_id),
+        )
+        return cur.rowcount
+
 def _set_group_owner(group_id: str, owner_user_id: str) -> None:
     with _get_conn() as conn:
         conn.execute(
@@ -1262,9 +1327,16 @@ def _create_group_with_owner(group_id: str, owner_user_id: str, name: Optional[s
             (group_id, owner_user_id),
         )
 
-        row = conn.execute("SELECT id, name FROM groups WHERE id = ?", (group_id,)).fetchone()
+        row = conn.execute(
+            "SELECT id, name, owner_user_id FROM groups WHERE id = ?", (group_id,)
+        ).fetchone()
 
-    return GroupPublic(id=row["id"], name=row["name"] if row else name, owner_user_id=owner_user_id)
+    actual_owner_id = row["owner_user_id"] if row else owner_user_id
+    return GroupPublic(
+        id=row["id"], name=row["name"] if row else name,
+        owner_user_id=actual_owner_id,
+        admin_user_ids=[actual_owner_id] if actual_owner_id else [],
+    )
 
 
 def _create_group(group_id: str, name: Optional[str] = None) -> GroupPublic:
@@ -1276,23 +1348,33 @@ def _create_group(group_id: str, name: Optional[str] = None) -> GroupPublic:
                 (name, group_id),
             )
         row = conn.execute("SELECT id, name FROM groups WHERE id = ?", (group_id,)).fetchone()
-    return GroupPublic(id=row["id"], name=row["name"] if row else name, owner_user_id=owner_user_id)
+    return GroupPublic(id=row["id"], name=row["name"] if row else name)
 
 
 def _list_user_groups(user_id: str) -> List[dict]:
     with _get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT g.id, g.name, g.owner_user_id
+            SELECT g.id, g.name, g.owner_user_id,
+                   GROUP_CONCAT(ga.user_id) AS admin_user_ids
             FROM groups g
             JOIN group_members gm ON gm.group_id = g.id
+            LEFT JOIN group_admins ga ON ga.group_id = g.id
             WHERE gm.user_id = ?
+            GROUP BY g.id, g.name, g.owner_user_id
             ORDER BY g.id
             """,
             (user_id,),
         ).fetchall()
         return [
-            {"id": r["id"], "name": r["name"], "owner_user_id": r["owner_user_id"]}
+            {
+                "id": r["id"], "name": r["name"],
+                "owner_user_id": r["owner_user_id"],
+                "admin_user_ids": list(dict.fromkeys(
+                    ([r["owner_user_id"]] if r["owner_user_id"] else [])
+                    + (r["admin_user_ids"].split(",") if r["admin_user_ids"] else [])
+                )),
+            }
             for r in rows
         ]
 
@@ -1581,15 +1663,21 @@ def _list_members_with_names(group_id: str) -> List[dict]:
     with _get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT u.id AS id, u.name AS name
+            SELECT u.id AS id, u.name AS name,
+                   CASE WHEN g.owner_user_id = u.id THEN 'owner'
+                        WHEN ga.user_id IS NOT NULL THEN 'admin'
+                        ELSE 'member' END AS role
             FROM group_members gm
             JOIN users u ON u.id = gm.user_id
+            JOIN groups g ON g.id = gm.group_id
+            LEFT JOIN group_admins ga
+              ON ga.group_id = gm.group_id AND ga.user_id = gm.user_id
             WHERE gm.group_id = ?
             ORDER BY u.name, u.id
             """,
             (group_id,),
         ).fetchall()
-        return [{"id": r["id"], "name": r["name"]} for r in rows]
+        return [{"id": r["id"], "name": r["name"], "role": r["role"]} for r in rows]
 
 
 def _is_member(group_id: str, user_id: str) -> bool:
@@ -2411,8 +2499,13 @@ async def request_to_join_group(
         return {"status": "already_member", "group_id": group_id, "user_id": current_user_id}
     await _db_call(_create_join_request, group_id, current_user_id)
     owner_id = await _db_call(_get_group_owner_id, group_id)
-    if owner_id and owner_id != current_user_id:
-        tokens = await _db_call(_list_push_tokens, owner_id)
+    if owner_id:
+        admin_ids = await _db_call(_list_admins, group_id)
+        token_lists = await asyncio.gather(*[
+            _db_call(_list_push_tokens, admin_id)
+            for admin_id in admin_ids if admin_id != current_user_id
+        ])
+        tokens = list(dict.fromkeys(token for token_list in token_lists for token in token_list))
         if tokens:
             requester = await _db_call(_get_user_by_id, current_user_id)
             requester_name = requester["name"] if requester else "Uusi käyttäjä"
@@ -2439,8 +2532,8 @@ async def list_join_requests(
     owner_id = await _db_call(_get_group_owner_id, group_id)
     if not owner_id:
         raise HTTPException(status_code=404, detail="group not found")
-    if owner_id != current_user_id:
-        raise HTTPException(status_code=403, detail="only group owner can view requests")
+    if not await _db_call(_is_group_admin, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="only group admins can view requests")
     requests = await _db_call(_list_join_requests_with_names, group_id)
     return {"group_id": group_id, "requests": requests}
 
@@ -2454,8 +2547,8 @@ async def approve_join_request(
     owner_id = await _db_call(_get_group_owner_id, group_id)
     if not owner_id:
         raise HTTPException(status_code=404, detail="group not found")
-    if owner_id != current_user_id:
-        raise HTTPException(status_code=403, detail="only group owner can approve requests")
+    if not await _db_call(_is_group_admin, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="only group admins can approve requests")
     if not await _db_call(_user_exists, user_id):
         raise HTTPException(status_code=404, detail="user not found")
     await _db_call(_add_member, group_id, user_id)
@@ -2472,8 +2565,8 @@ async def reject_join_request(
     owner_id = await _db_call(_get_group_owner_id, group_id)
     if not owner_id:
         raise HTTPException(status_code=404, detail="group not found")
-    if owner_id != current_user_id:
-        raise HTTPException(status_code=403, detail="only group owner can reject requests")
+    if not await _db_call(_is_group_admin, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="only group admins can reject requests")
     removed = await _db_call(_remove_join_request, group_id, user_id)
     if removed == 0:
         raise HTTPException(status_code=404, detail="request not found")
@@ -2498,10 +2591,10 @@ async def add_user_to_group(
             return {"status": "ok", "group_id": group_id, "user_id": user_id}
         raise HTTPException(status_code=404, detail="group not found")
 
-    # allow self-join, owner adds others
+    # Allow self-join; admins can add other users.
     is_self_join = current_user_id == user_id
-    if not is_self_join and owner_id != current_user_id:
-        raise HTTPException(status_code=403, detail="only group owner can add members")
+    if not is_self_join and not await _db_call(_is_group_admin, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="only group admins can add members")
 
     if not await _db_call(_user_exists, user_id):
         raise HTTPException(status_code=404, detail="user not found")
@@ -2523,10 +2616,16 @@ async def remove_user_from_group(
     if not owner_id:
         raise HTTPException(status_code=404, detail="group not found")
 
-    # allow self-leave, owner removes others
+    # Allow self-leave; admins can remove ordinary members.
     is_self_leave = current_user_id == user_id
-    if not is_self_leave and owner_id != current_user_id:
-        raise HTTPException(status_code=403, detail="only group owner can remove members")
+    current_user_is_admin = await _db_call(_is_group_admin, group_id, current_user_id)
+    if not is_self_leave and not current_user_is_admin:
+        raise HTTPException(status_code=403, detail="only group admins can remove members")
+    if not is_self_leave and user_id == owner_id:
+        raise HTTPException(status_code=400, detail="group owner cannot be removed")
+    target_is_admin = await _db_call(_is_group_admin, group_id, user_id)
+    if not is_self_leave and target_is_admin and current_user_id != owner_id:
+        raise HTTPException(status_code=403, detail="only group owner can remove admins")
 
     # prevent owner leaving if others still exist
     if is_self_leave and user_id == owner_id:
@@ -2547,6 +2646,55 @@ async def remove_user_from_group(
         return {"status": "deleted", "group_id": group_id, "user_id": user_id}
 
     return {"status": "ok", "group_id": group_id, "user_id": user_id}
+
+
+@app.get("/groups/{group_id}/admins")
+async def list_group_admins(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+    admin_ids = await _db_call(_list_admins, group_id)
+    return {"group_id": group_id, "admin_user_ids": admin_ids}
+
+
+@app.post("/groups/{group_id}/admins/{user_id}")
+async def add_group_admin(
+    group_id: str,
+    user_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if not owner_id:
+        raise HTTPException(status_code=404, detail="group not found")
+    if current_user_id != owner_id:
+        raise HTTPException(status_code=403, detail="only group owner can add admins")
+    if not await _db_call(_is_member, group_id, user_id):
+        raise HTTPException(status_code=400, detail="admin must be a group member")
+    await _db_call(_add_group_admin, group_id, user_id)
+    return {"status": "ok", "group_id": group_id, "user_id": user_id, "role": "admin"}
+
+
+@app.delete("/groups/{group_id}/admins/{user_id}")
+async def remove_group_admin(
+    group_id: str,
+    user_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if not owner_id:
+        raise HTTPException(status_code=404, detail="group not found")
+    if current_user_id != owner_id:
+        raise HTTPException(status_code=403, detail="only group owner can remove admins")
+    if user_id == owner_id:
+        raise HTTPException(status_code=400, detail="group owner cannot be demoted")
+    removed = await _db_call(_remove_group_admin, group_id, user_id)
+    if removed == 0:
+        raise HTTPException(status_code=404, detail="admin not found")
+    return {"status": "ok", "group_id": group_id, "user_id": user_id, "role": "member"}
 
 
 @app.delete("/groups/{group_id}")
