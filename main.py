@@ -880,6 +880,10 @@ class ContactDiscoveryRequest(BaseModel):
     phone_numbers: Optional[List[str]] = None
     # Accepted for compatibility with clients that use the shorter field name.
     phones: Optional[List[str]] = None
+    # Compatibility with mobile clients using camelCase or hashed contacts.
+    phoneNumbers: Optional[List[str]] = None
+    phone_hashes: Optional[List[str]] = None
+    phoneHashes: Optional[List[str]] = None
 
 
 class ContactDiscoveryMatch(BaseModel):
@@ -1168,7 +1172,7 @@ def _contact_identifier_hash(value: str) -> str:
 
 
 def _discover_users_by_phone_numbers(
-    phone_numbers: set[str], current_user_id: str
+    phone_numbers: set[str], phone_hashes: set[str], current_user_id: str
 ) -> List[dict]:
     matches = []
     with _get_conn() as conn:
@@ -1179,12 +1183,15 @@ def _discover_users_by_phone_numbers(
 
     for row in rows:
         normalized_phone = _normalize_e164_phone(row["phone"])
-        if normalized_phone and normalized_phone in phone_numbers:
+        if not normalized_phone:
+            continue
+        normalized_hash = _contact_identifier_hash(normalized_phone)
+        if normalized_phone in phone_numbers or normalized_hash in phone_hashes:
             matches.append(
                 {
                     "id": row["id"],
                     "name": row["name"],
-                    "matched_phone_hashes": [_contact_identifier_hash(normalized_phone)],
+                    "matched_phone_hashes": [normalized_hash],
                 }
             )
     return matches
@@ -2117,9 +2124,14 @@ async def discover_users_by_contacts(
     payload: ContactDiscoveryRequest,
     current_user_id: str = Depends(get_current_user_id),
 ):
-    submitted_numbers = (payload.phone_numbers or []) + (payload.phones or [])
-    if len(submitted_numbers) > 1000:
-        raise HTTPException(status_code=400, detail="at most 1000 phone numbers are allowed")
+    submitted_numbers = (
+        (payload.phone_numbers or [])
+        + (payload.phones or [])
+        + (payload.phoneNumbers or [])
+    )
+    submitted_hashes = (payload.phone_hashes or []) + (payload.phoneHashes or [])
+    if len(submitted_numbers) + len(submitted_hashes) > 1000:
+        raise HTTPException(status_code=400, detail="at most 1000 contacts are allowed")
 
     phone_numbers = set()
     for value in submitted_numbers:
@@ -2131,9 +2143,26 @@ async def discover_users_by_contacts(
             )
         phone_numbers.add(normalized_phone)
 
-    if not phone_numbers:
+    phone_hashes = set()
+    for value in submitted_hashes:
+        normalized_hash = value.strip().lower()
+        if len(normalized_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in normalized_hash
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="phone hashes must be lowercase or uppercase SHA-256 hex strings",
+            )
+        phone_hashes.add(normalized_hash)
+
+    if not phone_numbers and not phone_hashes:
         return []
-    return await _db_call(_discover_users_by_phone_numbers, phone_numbers, current_user_id)
+    return await _db_call(
+        _discover_users_by_phone_numbers,
+        phone_numbers,
+        phone_hashes,
+        current_user_id,
+    )
 
 
 @app.put("/users/{user_id}/discoverability")
