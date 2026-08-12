@@ -2347,27 +2347,28 @@ async def login(payload: "LoginRequest"):
 
 @app.post("/auth/forgot-password")
 async def forgot_password(payload: ForgotPasswordRequest):
-    email = str(payload.email)
-    if FIREBASE_WEB_API_KEY:
-        try:
-            firebase_result = await asyncio.to_thread(_send_firebase_password_reset_email, email)
-        except RuntimeError as e:
-            raise HTTPException(status_code=502, detail=str(e))
+    email = str(payload.email).strip().lower()
 
-        if firebase_result == "sent":
-            print(f"Firebase password reset email requested for {email}")
-            return {"status": "ok"}
-
-        print(f"Firebase password reset skipped for {email}: email not found in Firebase Auth")
-    else:
-        print("Firebase password reset is not configured; using local SMTP reset flow")
-
+    # Authentication for local users is backed by users.password_hash, so a
+    # Firebase reset does not change the password accepted by /auth/login.
+    # Prefer the matching local reset flow even when Firebase is configured.
     token = await _db_call(_create_password_reset_token, email)
     if token:
         try:
             await asyncio.to_thread(_send_password_reset_email, email, token)
         except RuntimeError as e:
             raise HTTPException(status_code=502, detail=str(e))
+        return {"status": "ok"}
+
+    if FIREBASE_WEB_API_KEY:
+        try:
+            firebase_result = await asyncio.to_thread(_send_firebase_password_reset_email, email)
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        if firebase_result == "sent":
+            print(f"Firebase password reset email requested for {email}")
+            return {"status": "ok"}
+        print(f"Firebase password reset skipped for {email}: email not found in Firebase Auth")
     else:
         print(f"Password reset skipped for {email}: email not found in local users")
     return {"status": "ok"}
