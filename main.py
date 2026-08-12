@@ -2349,11 +2349,11 @@ async def login(payload: "LoginRequest"):
 async def forgot_password(payload: ForgotPasswordRequest):
     email = str(payload.email).strip().lower()
 
-    # Authentication for local users is backed by users.password_hash, so a
-    # Firebase reset does not change the password accepted by /auth/login.
-    # Prefer the matching local reset flow even when Firebase is configured.
-    token = await _db_call(_create_password_reset_token, email)
-    if token:
+    # Local reset links need SMTP for delivery. Do not create and invalidate
+    # tokens when this deployment has no way to send them.
+    local_user = await _db_call(_get_user_by_email, email)
+    if local_user and SMTP_HOST:
+        token = await _db_call(_create_password_reset_token, email)
         try:
             await asyncio.to_thread(_send_password_reset_email, email, token)
         except RuntimeError as e:
@@ -2369,6 +2369,8 @@ async def forgot_password(payload: ForgotPasswordRequest):
             print(f"Firebase password reset email requested for {email}")
             return {"status": "ok"}
         print(f"Firebase password reset skipped for {email}: email not found in Firebase Auth")
+    elif local_user:
+        print(f"Password reset cannot be sent for {email}: SMTP_HOST is not configured")
     else:
         print(f"Password reset skipped for {email}: email not found in local users")
     return {"status": "ok"}
