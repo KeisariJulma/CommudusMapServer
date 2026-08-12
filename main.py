@@ -2352,7 +2352,12 @@ async def forgot_password(payload: ForgotPasswordRequest):
     # Local reset links need SMTP for delivery. Do not create and invalidate
     # tokens when this deployment has no way to send them.
     local_user = await _db_call(_get_user_by_email, email)
-    if local_user and SMTP_HOST:
+    if local_user:
+        if not SMTP_HOST:
+            raise HTTPException(
+                status_code=503,
+                detail="Password reset email is not configured on the server",
+            )
         token = await _db_call(_create_password_reset_token, email)
         try:
             await asyncio.to_thread(_send_password_reset_email, email, token)
@@ -2369,8 +2374,6 @@ async def forgot_password(payload: ForgotPasswordRequest):
             print(f"Firebase password reset email requested for {email}")
             return {"status": "ok"}
         print(f"Firebase password reset skipped for {email}: email not found in Firebase Auth")
-    elif local_user:
-        print(f"Password reset cannot be sent for {email}: SMTP_HOST is not configured")
     else:
         print(f"Password reset skipped for {email}: email not found in local users")
     return {"status": "ok"}
