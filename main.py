@@ -5,6 +5,7 @@ from fastapi.security import OAuth2PasswordBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field
 from typing import Dict, List, Optional
+from collections import deque
 import uvicorn
 import time
 import asyncio
@@ -913,6 +914,13 @@ class PasswordResetRequest(BaseModel):
     new_password: str
 
 
+class GpsTrailPoint(BaseModel):
+    lat: float
+    lon: float
+    heading: Optional[float] = None
+    timestamp: float
+
+
 class UserLocation(BaseModel):
     user_id: str
     username: str
@@ -920,6 +928,7 @@ class UserLocation(BaseModel):
     lon: float
     heading: Optional[float] = None
     last_seen: float = 0.0
+    trail: List[GpsTrailPoint] = Field(default_factory=list)
 
 
 class GroupCreate(BaseModel):
@@ -2352,12 +2361,7 @@ async def forgot_password(payload: ForgotPasswordRequest):
     # Local reset links need SMTP for delivery. Do not create and invalidate
     # tokens when this deployment has no way to send them.
     local_user = await _db_call(_get_user_by_email, email)
-    if local_user:
-        if not SMTP_HOST:
-            raise HTTPException(
-                status_code=503,
-                detail="Password reset email is not configured on the server",
-            )
+    if local_user and SMTP_HOST:
         token = await _db_call(_create_password_reset_token, email)
         try:
             await asyncio.to_thread(_send_password_reset_email, email, token)
@@ -2374,6 +2378,11 @@ async def forgot_password(payload: ForgotPasswordRequest):
             print(f"Firebase password reset email requested for {email}")
             return {"status": "ok"}
         print(f"Firebase password reset skipped for {email}: email not found in Firebase Auth")
+    elif local_user:
+        raise HTTPException(
+            status_code=503,
+            detail="Password reset email is not configured on the server",
+        )
     else:
         print(f"Password reset skipped for {email}: email not found in local users")
     return {"status": "ok"}
@@ -3152,17 +3161,25 @@ async def get_group_sharing(group_id: str, current_user_id: str = Depends(get_cu
 
 
 @app.get("/groups/{group_id}/locations", response_model=List[UserLocation])
-async def get_group_locations(group_id: str):
-    try:
-        if not await _db_call(_group_exists, group_id):
-            raise HTTPException(status_code=404, detail="group not found")
+async def get_group_locations(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
 
-        allowed_ids = set(await _db_call(_get_share_enabled_member_ids, group_id))
-        # Only return users who are both allowed AND currently have a live location in memory
-        return [loc for uid, loc in user_store.items() if uid in allowed_ids]
-    except Exception as exc:
-        print(f"ERROR in /groups/{group_id}/locations:", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+    allowed_ids = set(await _db_call(_get_share_enabled_member_ids, group_id))
+    now = time.time()
+    result = []
+    for user_id, location in user_store.items():
+        if user_id not in allowed_ids:
+            continue
+        _prune_gps_trail(user_id, now)
+        location.trail = list(user_trails.get(user_id, ()))
+        result.append(location)
+    return result
 
 
 # -----------------------
@@ -3179,12 +3196,55 @@ app.add_middleware(
 # -----------------------
 # User Location Tracking
 # -----------------------
+GPS_TRAIL_MAX_POINTS = max(1, int(os.environ.get("GPS_TRAIL_MAX_POINTS", "100")))
+GPS_TRAIL_MAX_AGE_SECONDS = max(
+    1, int(os.environ.get("GPS_TRAIL_MAX_AGE_SECONDS", "300"))
+)
 user_store: Dict[str, UserLocation] = {}
+user_trails: Dict[str, deque[GpsTrailPoint]] = {}
+
+
+def _prune_gps_trail(user_id: str, now: Optional[float] = None) -> None:
+    trail = user_trails.get(user_id)
+    if trail is None:
+        return
+    cutoff = (time.time() if now is None else now) - GPS_TRAIL_MAX_AGE_SECONDS
+    while trail and trail[0].timestamp < cutoff:
+        trail.popleft()
+    if not trail:
+        user_trails.pop(user_id, None)
+
+
+def _record_gps_point(location: UserLocation) -> None:
+    trail = user_trails.setdefault(
+        location.user_id, deque(maxlen=GPS_TRAIL_MAX_POINTS)
+    )
+    trail.append(
+        GpsTrailPoint(
+            lat=location.lat,
+            lon=location.lon,
+            heading=location.heading,
+            timestamp=location.last_seen,
+        )
+    )
+    _prune_gps_trail(location.user_id, location.last_seen)
+    location.trail = list(trail)
 
 
 @app.post("/update-location")
-async def update_location(location: UserLocation):
+async def update_location(
+    location: UserLocation,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if location.user_id != current_user_id:
+        raise HTTPException(status_code=403, detail="cannot update another user's location")
+    user = await _db_call(_get_user_by_id, current_user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+
+    location.username = user["name"]
     location.last_seen = time.time()
+    _record_gps_point(location)
     user_store[location.user_id] = location
     print(f"📍 Location update: {location.username} ({location.user_id}) -> {location.lat}, {location.lon}")
     return {"status": "ok"}
@@ -3201,9 +3261,14 @@ async def startup_event():
         while True:
             await asyncio.sleep(10)
             now = time.time()
-            removed = [uid for uid, loc in user_store.items() if now - loc.last_seen > 300]
+            removed = [
+                uid
+                for uid, loc in user_store.items()
+                if now - loc.last_seen > GPS_TRAIL_MAX_AGE_SECONDS
+            ]
             for uid in removed:
                 user = user_store.pop(uid)
+                user_trails.pop(uid, None)
                 print(f"🗑️ Removed inactive user: {user.username} ({uid})")
 
     asyncio.create_task(cleanup_inactive_users())
