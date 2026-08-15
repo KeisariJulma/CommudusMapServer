@@ -253,6 +253,83 @@ def _parse_coordinate_pair(value: object) -> Optional[List[float]]:
     return [lon, lat]
 
 
+HUNTING_AREA_MAX_BYTES = max(
+    1, int(os.environ.get("HUNTING_AREA_MAX_BYTES", str(1024 * 1024)))
+)
+
+
+def _validate_hunting_area_position(value: object) -> None:
+    if not isinstance(value, list) or len(value) < 2:
+        raise ValueError("positions must contain longitude and latitude")
+    lon = _parse_finite_number(value[0])
+    lat = _parse_finite_number(value[1])
+    if lon is None or lat is None or not -180 <= lon <= 180 or not -90 <= lat <= 90:
+        raise ValueError("coordinates are outside valid longitude/latitude ranges")
+    for extra in value[2:]:
+        if _parse_finite_number(extra) is None:
+            raise ValueError("extra position values must be finite numbers")
+
+
+def _validate_hunting_area_polygon(coordinates: object) -> None:
+    if not isinstance(coordinates, list) or not coordinates:
+        raise ValueError("Polygon coordinates must contain at least one ring")
+    for ring in coordinates:
+        if not isinstance(ring, list) or len(ring) < 4:
+            raise ValueError("polygon rings must contain at least four positions")
+        for position in ring:
+            _validate_hunting_area_position(position)
+        if ring[0] != ring[-1]:
+            raise ValueError("polygon rings must be closed")
+
+
+def _validate_hunting_area_geometry(geometry: object) -> None:
+    if not isinstance(geometry, dict):
+        raise ValueError("GeoJSON geometry must be an object")
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    if geometry_type == "Polygon":
+        _validate_hunting_area_polygon(coordinates)
+        return
+    if geometry_type == "MultiPolygon":
+        if not isinstance(coordinates, list) or not coordinates:
+            raise ValueError("MultiPolygon coordinates must contain a polygon")
+        for polygon in coordinates:
+            _validate_hunting_area_polygon(polygon)
+        return
+    raise ValueError("hunting area must use Polygon or MultiPolygon geometry")
+
+
+def _validate_hunting_area_geojson(value: object) -> Dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("GeoJSON body must be an object")
+
+    # Also accept {"geojson": ...} for clients that wrap the document.
+    wrapped = value.get("geojson")
+    if isinstance(wrapped, dict) and "type" not in value:
+        value = wrapped
+
+    geojson_type = value.get("type")
+    if geojson_type in {"Polygon", "MultiPolygon"}:
+        _validate_hunting_area_geometry(value)
+    elif geojson_type == "Feature":
+        _validate_hunting_area_geometry(value.get("geometry"))
+    elif geojson_type == "FeatureCollection":
+        features = value.get("features")
+        if not isinstance(features, list) or not features:
+            raise ValueError("FeatureCollection must contain at least one feature")
+        for feature in features:
+            if not isinstance(feature, dict) or feature.get("type") != "Feature":
+                raise ValueError("FeatureCollection entries must be GeoJSON Features")
+            _validate_hunting_area_geometry(feature.get("geometry"))
+    else:
+        raise ValueError("unsupported GeoJSON type")
+
+    encoded = json.dumps(value, allow_nan=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > HUNTING_AREA_MAX_BYTES:
+        raise ValueError("hunting area is too large")
+    return value
+
+
 def _normalize_passi_line_payload(value: object, index: int) -> Optional[dict]:
     if not isinstance(value, dict):
         return None
@@ -616,6 +693,15 @@ def _init_db() -> None:
               FOREIGN KEY (group_id, ajo_group_id)
                 REFERENCES group_passi_ajo_groups(group_id, id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS group_hunting_areas (
+              group_id TEXT PRIMARY KEY,
+              geojson_json TEXT NOT NULL,
+              updated_at REAL NOT NULL,
+              updated_by TEXT NOT NULL,
+              FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+              FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE CASCADE
+            );
             """
         )
 
@@ -927,6 +1013,7 @@ class UserLocation(BaseModel):
     lat: float
     lon: float
     heading: Optional[float] = None
+    accuracy: Optional[float] = None
     last_seen: float = 0.0
     trail: List[GpsTrailPoint] = Field(default_factory=list)
 
@@ -1292,6 +1379,34 @@ def _get_group_name(group_id: str) -> Optional[str]:
         if not row:
             return None
         return row["name"]
+
+
+def _get_group_hunting_area(group_id: str) -> Optional[Dict[str, object]]:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT geojson_json FROM group_hunting_areas WHERE group_id = ?",
+            (group_id,),
+        ).fetchone()
+    return json.loads(row["geojson_json"]) if row else None
+
+
+def _save_group_hunting_area(
+    group_id: str, user_id: str, geojson: Dict[str, object]
+) -> Dict[str, object]:
+    encoded = json.dumps(geojson, allow_nan=False, separators=(",", ":"))
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO group_hunting_areas(group_id, geojson_json, updated_at, updated_by)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(group_id) DO UPDATE SET
+              geojson_json = excluded.geojson_json,
+              updated_at = excluded.updated_at,
+              updated_by = excluded.updated_by
+            """,
+            (group_id, encoded, time.time(), user_id),
+        )
+    return geojson
 
 
 def _list_admins(group_id: str) -> List[str]:
@@ -2818,6 +2933,45 @@ async def list_group_members(
     return {"group_id": group_id, "members": members}
 
 
+@app.get("/groups/{group_id}/hunting-area")
+async def get_group_hunting_area(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+    area = await _db_call(_get_group_hunting_area, group_id)
+    if area is None:
+        raise HTTPException(status_code=404, detail="hunting area not found")
+    return area
+
+
+@app.put("/groups/{group_id}/hunting-area")
+async def save_group_hunting_area(
+    group_id: str,
+    request: Request,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if owner_id is None:
+        raise HTTPException(status_code=404, detail="group not found")
+    if current_user_id != owner_id:
+        raise HTTPException(status_code=403, detail="only group owner can update hunting area")
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    try:
+        geojson = _validate_hunting_area_geojson(payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid hunting area: {exc}")
+    return await _db_call(
+        _save_group_hunting_area, group_id, current_user_id, geojson
+    )
+
+
 @app.get("/groups/{group_id}/passipaikat", response_model=Dict[str, List[PassipaikkaListPublic]])
 async def get_group_passipaikat(
     group_id: str,
@@ -3236,6 +3390,16 @@ async def update_location(
     location: UserLocation,
     current_user_id: str = Depends(get_current_user_id),
 ):
+    if location.accuracy is not None and (
+        not math.isfinite(location.accuracy)
+        or not 0 <= location.accuracy <= 10_000
+    ):
+        raise HTTPException(status_code=400, detail="Invalid GPS accuracy")
+    if location.heading is not None and (
+        not math.isfinite(location.heading)
+        or not 0 <= location.heading < 360
+    ):
+        raise HTTPException(status_code=400, detail="Invalid heading")
     if location.user_id != current_user_id:
         raise HTTPException(status_code=403, detail="cannot update another user's location")
     user = await _db_call(_get_user_by_id, current_user_id)
