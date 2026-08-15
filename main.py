@@ -1409,6 +1409,14 @@ def _save_group_hunting_area(
     return geojson
 
 
+def _delete_group_hunting_area(group_id: str) -> bool:
+    with _get_conn() as conn:
+        cursor = conn.execute(
+            "DELETE FROM group_hunting_areas WHERE group_id = ?", (group_id,)
+        )
+        return cursor.rowcount > 0
+
+
 def _list_admins(group_id: str) -> List[str]:
     with _get_conn() as conn:
         rows = conn.execute(
@@ -2970,6 +2978,20 @@ async def save_group_hunting_area(
     return await _db_call(
         _save_group_hunting_area, group_id, current_user_id, geojson
     )
+
+
+@app.delete("/groups/{group_id}/hunting-area")
+async def delete_group_hunting_area(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if owner_id is None:
+        raise HTTPException(status_code=404, detail="group not found")
+    if current_user_id != owner_id:
+        raise HTTPException(status_code=403, detail="only group owner can delete hunting area")
+    deleted = await _db_call(_delete_group_hunting_area, group_id)
+    return {"status": "deleted", "group_id": group_id, "deleted": deleted}
 
 
 @app.get("/groups/{group_id}/passipaikat", response_model=Dict[str, List[PassipaikkaListPublic]])
