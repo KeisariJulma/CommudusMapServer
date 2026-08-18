@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
@@ -35,14 +35,23 @@ app = FastAPI()
 DB_PATH = "app.db"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+GROUP_ICON_DIR = Path("group-icons")
+GROUP_ICON_DIR.mkdir(parents=True, exist_ok=True)
 MML_API_KEY = os.environ.get("MML_API_KEY", "6ca6d0d1-33bb-4cf4-8840-f6da4874929d")
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+app.mount("/group-icons", StaticFiles(directory=str(GROUP_ICON_DIR)), name="group-icons")
 
 JWT_SECRET = os.environ.get("JWT_SECRET")  # set this in your shell
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRES_SECONDS = 60 * 60 * 24 * 365 * 10   # 7 days
 PASSWORD_RESET_EXPIRES_SECONDS = int(os.environ.get("PASSWORD_RESET_EXPIRES_SECONDS", "3600"))
 PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://exclusionzone.org")
+GROUP_ICON_MAX_BYTES = max(
+    1, int(os.environ.get("GROUP_ICON_MAX_BYTES", str(200 * 1024)))
+)
+GROUP_ICON_MAX_DIMENSION = max(
+    1, int(os.environ.get("GROUP_ICON_MAX_DIMENSION", "1024"))
+)
 SMTP_HOST = os.environ.get("SMTP_HOST")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
@@ -702,6 +711,16 @@ def _init_db() -> None:
               FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
               FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS group_icon_images (
+              group_id TEXT PRIMARY KEY,
+              image_path TEXT NOT NULL,
+              media_type TEXT NOT NULL,
+              updated_at REAL NOT NULL,
+              updated_by TEXT NOT NULL,
+              FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+              FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE CASCADE
+            );
             """
         )
 
@@ -930,6 +949,112 @@ def _save_uploaded_image(upload: UploadFile) -> str:
     return filename
 
 
+def _jpeg_dimensions(data: bytes) -> Optional[tuple[int, int]]:
+    if not data.startswith(b"\xff\xd8"):
+        return None
+    offset = 2
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    while offset + 4 <= len(data):
+        if data[offset] != 0xFF:
+            return None
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return None
+        marker = data[offset]
+        offset += 1
+        if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(data):
+            return None
+        segment_length = int.from_bytes(data[offset:offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            return None
+        if marker in sof_markers:
+            if segment_length < 7:
+                return None
+            height = int.from_bytes(data[offset + 3:offset + 5], "big")
+            width = int.from_bytes(data[offset + 5:offset + 7], "big")
+            return width, height
+        offset += segment_length
+    return None
+
+
+def _detect_group_icon(data: bytes) -> tuple[str, str, int, int]:
+    if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 33:
+        if data[12:16] != b"IHDR" or b"IEND" not in data:
+            raise ValueError("invalid PNG structure")
+        width = int.from_bytes(data[16:20], "big")
+        height = int.from_bytes(data[20:24], "big")
+        media_type, extension = "image/png", ".png"
+    elif data.startswith(b"\xff\xd8"):
+        dimensions = _jpeg_dimensions(data)
+        if dimensions is None or not data.endswith(b"\xff\xd9"):
+            raise ValueError("invalid JPEG structure")
+        width, height = dimensions
+        media_type, extension = "image/jpeg", ".jpg"
+    elif (
+        len(data) >= 30
+        and data.startswith(b"RIFF")
+        and data[8:12] == b"WEBP"
+        and int.from_bytes(data[4:8], "little") + 8 == len(data)
+    ):
+        chunk_type = data[12:16]
+        if chunk_type == b"VP8X":
+            if data[20] & 0x02:
+                raise ValueError("animated WebP is not supported")
+            width = int.from_bytes(data[24:27], "little") + 1
+            height = int.from_bytes(data[27:30], "little") + 1
+        elif chunk_type == b"VP8 " and data[23:26] == b"\x9d\x01\x2a":
+            width = int.from_bytes(data[26:28], "little") & 0x3FFF
+            height = int.from_bytes(data[28:30], "little") & 0x3FFF
+        elif chunk_type == b"VP8L" and data[20] == 0x2F:
+            packed = int.from_bytes(data[21:25], "little")
+            width = (packed & 0x3FFF) + 1
+            height = ((packed >> 14) & 0x3FFF) + 1
+        else:
+            raise ValueError("invalid WebP structure")
+        media_type, extension = "image/webp", ".webp"
+    else:
+        raise ValueError("file must be a PNG, JPEG, or WebP image")
+
+    if width < 1 or height < 1:
+        raise ValueError("image dimensions are invalid")
+    if width != height:
+        raise ValueError("group icon must be square")
+    if width > GROUP_ICON_MAX_DIMENSION or height > GROUP_ICON_MAX_DIMENSION:
+        raise ValueError(
+            f"image dimensions must not exceed {GROUP_ICON_MAX_DIMENSION}x{GROUP_ICON_MAX_DIMENSION}"
+        )
+    return media_type, extension, width, height
+
+
+def _build_group_icon_url(image_path: str) -> str:
+    base_url = PUBLIC_APP_URL.rstrip("/")
+    safe_name = urllib.parse.quote(image_path, safe="")
+    return f"{base_url}/group-icons/{safe_name}"
+
+
+def _write_group_icon(data: bytes, extension: str) -> str:
+    filename = f"{uuid.uuid4().hex}{extension}"
+    destination = GROUP_ICON_DIR / filename
+    with destination.open("xb") as output:
+        output.write(data)
+    return filename
+
+
+def _unlink_group_icon(image_path: Optional[str]) -> None:
+    if not image_path:
+        return
+    try:
+        (GROUP_ICON_DIR / Path(image_path).name).unlink(missing_ok=True)
+    except OSError as exc:
+        print("Failed to delete group icon", image_path, exc)
+
+
 async def _db_call(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
 
@@ -1028,6 +1153,7 @@ class GroupPublic(BaseModel):
     name: Optional[str] = None
     owner_user_id: Optional[str] = None
     admin_user_ids: List[str] = Field(default_factory=list)
+    icon_url: Optional[str] = None
 
 
 class PassipaikkaPublic(BaseModel):
@@ -1417,6 +1543,40 @@ def _delete_group_hunting_area(group_id: str) -> bool:
         return cursor.rowcount > 0
 
 
+def _replace_group_icon_record(
+    group_id: str, user_id: str, image_path: str, media_type: str
+) -> Optional[str]:
+    with _get_conn() as conn:
+        previous = conn.execute(
+            "SELECT image_path FROM group_icon_images WHERE group_id = ?",
+            (group_id,),
+        ).fetchone()
+        conn.execute(
+            """
+            INSERT INTO group_icon_images(group_id, image_path, media_type, updated_at, updated_by)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(group_id) DO UPDATE SET
+              image_path = excluded.image_path,
+              media_type = excluded.media_type,
+              updated_at = excluded.updated_at,
+              updated_by = excluded.updated_by
+            """,
+            (group_id, image_path, media_type, time.time(), user_id),
+        )
+    return previous["image_path"] if previous else None
+
+
+def _delete_group_icon_record(group_id: str) -> Optional[str]:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT image_path FROM group_icon_images WHERE group_id = ?",
+            (group_id,),
+        ).fetchone()
+        if row:
+            conn.execute("DELETE FROM group_icon_images WHERE group_id = ?", (group_id,))
+    return row["image_path"] if row else None
+
+
 def _list_admins(group_id: str) -> List[str]:
     with _get_conn() as conn:
         rows = conn.execute(
@@ -1538,12 +1698,14 @@ def _list_user_groups(user_id: str) -> List[dict]:
         rows = conn.execute(
             """
             SELECT g.id, g.name, g.owner_user_id,
-                   GROUP_CONCAT(ga.user_id) AS admin_user_ids
+                   GROUP_CONCAT(ga.user_id) AS admin_user_ids,
+                   gi.image_path AS icon_image_path
             FROM groups g
             JOIN group_members gm ON gm.group_id = g.id
             LEFT JOIN group_admins ga ON ga.group_id = g.id
+            LEFT JOIN group_icon_images gi ON gi.group_id = g.id
             WHERE gm.user_id = ?
-            GROUP BY g.id, g.name, g.owner_user_id
+            GROUP BY g.id, g.name, g.owner_user_id, gi.image_path
             ORDER BY g.id
             """,
             (user_id,),
@@ -1552,6 +1714,10 @@ def _list_user_groups(user_id: str) -> List[dict]:
             {
                 "id": r["id"], "name": r["name"],
                 "owner_user_id": r["owner_user_id"],
+                "icon_url": (
+                    _build_group_icon_url(r["icon_image_path"])
+                    if r["icon_image_path"] else None
+                ),
                 "admin_user_ids": (
                     r["admin_user_ids"].split(",") if r["admin_user_ids"] else []
                 ),
@@ -1973,6 +2139,7 @@ def _delete_group_uploads(group_id: str) -> None:
             pass
         except Exception as exc:
             print("Failed to delete upload", image_path, exc)
+    _unlink_group_icon(_delete_group_icon_record(group_id))
 
 
 def _purge_empty_groups() -> None:
@@ -2992,6 +3159,73 @@ async def delete_group_hunting_area(
         raise HTTPException(status_code=403, detail="only group owner can delete hunting area")
     deleted = await _db_call(_delete_group_hunting_area, group_id)
     return {"status": "deleted", "group_id": group_id, "deleted": deleted}
+
+
+@app.put("/groups/{group_id}/icon-image")
+async def upload_group_icon_image(
+    group_id: str,
+    file: UploadFile = File(...),
+    current_user_id: str = Depends(get_current_user_id),
+):
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if owner_id is None:
+        raise HTTPException(status_code=404, detail="group not found")
+    if current_user_id != owner_id:
+        raise HTTPException(status_code=403, detail="only group owner can update icon image")
+
+    try:
+        data = await file.read(GROUP_ICON_MAX_BYTES + 1)
+    finally:
+        await file.close()
+    if not data:
+        raise HTTPException(status_code=400, detail="icon image is empty")
+    if len(data) > GROUP_ICON_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"icon image must not exceed {GROUP_ICON_MAX_BYTES} bytes",
+        )
+    try:
+        media_type, extension, width, height = _detect_group_icon(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid icon image: {exc}")
+
+    image_path = await asyncio.to_thread(_write_group_icon, data, extension)
+    try:
+        previous_path = await _db_call(
+            _replace_group_icon_record,
+            group_id,
+            current_user_id,
+            image_path,
+            media_type,
+        )
+    except Exception:
+        await asyncio.to_thread(_unlink_group_icon, image_path)
+        raise
+    await asyncio.to_thread(_unlink_group_icon, previous_path)
+    return {
+        "icon_url": _build_group_icon_url(image_path),
+        "width": width,
+        "height": height,
+    }
+
+
+@app.delete("/groups/{group_id}/icon-image")
+async def delete_group_icon_image(
+    group_id: str,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    owner_id = await _db_call(_get_group_owner_id, group_id)
+    if owner_id is None:
+        raise HTTPException(status_code=404, detail="group not found")
+    if current_user_id != owner_id:
+        raise HTTPException(status_code=403, detail="only group owner can delete icon image")
+    image_path = await _db_call(_delete_group_icon_record, group_id)
+    await asyncio.to_thread(_unlink_group_icon, image_path)
+    return {
+        "status": "deleted",
+        "group_id": group_id,
+        "deleted": image_path is not None,
+    }
 
 
 @app.get("/groups/{group_id}/passipaikat", response_model=Dict[str, List[PassipaikkaListPublic]])
