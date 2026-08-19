@@ -829,11 +829,10 @@ def _init_db() -> None:
                 "SELECT id, is_admin FROM users WHERE LOWER(email) = ?", (admin_email,)
             ).fetchone()
             if existing_admin:
-                if not existing_admin["is_admin"]:
-                    conn.execute(
-                        "UPDATE users SET is_admin = 1, password_hash = ? WHERE id = ?",
-                        (_hash_password(ADMIN_PASSWORD), existing_admin["id"]),
-                    )
+                conn.execute(
+                    "UPDATE users SET is_admin = 1, password_hash = ? WHERE id = ?",
+                    (_hash_password(ADMIN_PASSWORD), existing_admin["id"]),
+                )
             else:
                 conn.execute(
                     """
