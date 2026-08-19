@@ -57,6 +57,9 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USERNAME or "no-reply@exclusionzone.org")
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+ADMIN_NAME = os.environ.get("ADMIN_NAME", "Administrator")
 FIREBASE_WEB_API_KEY = os.environ.get("FIREBASE_WEB_API_KEY")
 FIREBASE_PASSWORD_RESET_CONTINUE_URL = os.environ.get("FIREBASE_PASSWORD_RESET_CONTINUE_URL")
 FIREBASE_PASSWORD_RESET_ANDROID_PACKAGE_NAME = os.environ.get(
@@ -577,6 +580,7 @@ def _init_db() -> None:
               email TEXT UNIQUE,
               phone TEXT,
               discoverable INTEGER NOT NULL DEFAULT 1,
+              is_admin INTEGER NOT NULL DEFAULT 0,
               password_hash TEXT NOT NULL,
               created_at REAL NOT NULL
             );
@@ -776,6 +780,12 @@ def _init_db() -> None:
         except sqlite3.OperationalError:
             pass
 
+        # Migration: distinguish server administrators from group administrators.
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
         # Migration: allow NULL email and ensure unique phone
         try:
             columns = conn.execute("PRAGMA table_info(users)").fetchall()
@@ -790,12 +800,13 @@ def _init_db() -> None:
                         "email TEXT UNIQUE, "
                         "phone TEXT UNIQUE, "
                         "discoverable INTEGER NOT NULL DEFAULT 1, "
+                        "is_admin INTEGER NOT NULL DEFAULT 0, "
                         "password_hash TEXT NOT NULL, "
                         "created_at REAL NOT NULL)"
                     )
                     conn.execute(
-                        "INSERT INTO users_new(id, name, email, phone, discoverable, password_hash, created_at) "
-                        "SELECT id, name, email, phone, discoverable, password_hash, created_at FROM users"
+                        "INSERT INTO users_new(id, name, email, phone, discoverable, is_admin, password_hash, created_at) "
+                        "SELECT id, name, email, phone, discoverable, is_admin, password_hash, created_at FROM users"
                     )
                     conn.execute("DROP TABLE users")
                     conn.execute("ALTER TABLE users_new RENAME TO users")
@@ -808,6 +819,38 @@ def _init_db() -> None:
                     pass
         except sqlite3.OperationalError:
             pass
+
+        # Bootstrap (or promote) the configured administrator. Keeping these
+        # credentials in the environment avoids hard-coding a privileged user.
+        if ADMIN_EMAIL and ADMIN_PASSWORD:
+            admin_email = ADMIN_EMAIL.strip().lower()
+            admin_name = ADMIN_NAME.strip() or "Administrator"
+            existing_admin = conn.execute(
+                "SELECT id, is_admin FROM users WHERE LOWER(email) = ?", (admin_email,)
+            ).fetchone()
+            if existing_admin:
+                if not existing_admin["is_admin"]:
+                    conn.execute(
+                        "UPDATE users SET is_admin = 1, password_hash = ? WHERE id = ?",
+                        (_hash_password(ADMIN_PASSWORD), existing_admin["id"]),
+                    )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO users(
+                      id, name, email, phone, discoverable, is_admin, password_hash, created_at
+                    ) VALUES (?, ?, ?, NULL, 0, 1, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        admin_name,
+                        admin_email,
+                        _hash_password(ADMIN_PASSWORD),
+                        time.time(),
+                    ),
+                )
+        elif ADMIN_EMAIL or ADMIN_PASSWORD:
+            print("Admin account not configured: set both ADMIN_EMAIL and ADMIN_PASSWORD")
         # Migration: add image_path to group_messages
         try:
             conn.execute("ALTER TABLE group_messages ADD COLUMN image_path TEXT")
@@ -1075,6 +1118,11 @@ class UserPublic(BaseModel):
     name: str
     email: Optional[EmailStr] = None
     phone: Optional[str] = None
+
+
+class AdminUserPublic(UserPublic):
+    is_admin: bool
+    created_at: float
 
 
 class UserPhoneUpdate(BaseModel):
@@ -1387,6 +1435,36 @@ def _get_user_by_phone(phone: str) -> Optional[sqlite3.Row]:
 def _get_user_by_id(user_id: str) -> Optional[sqlite3.Row]:
     with _get_conn() as conn:
         return conn.execute("SELECT id, name, email, phone FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
+def _is_server_admin(user_id: str) -> bool:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT is_admin FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return bool(row and row["is_admin"])
+
+
+def _list_users_for_admin() -> List[dict]:
+    with _get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, email, phone, is_admin, created_at
+            FROM users
+            ORDER BY LOWER(name), created_at
+            """
+        ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "email": row["email"],
+                "phone": row["phone"],
+                "is_admin": bool(row["is_admin"]),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
 
 
 def _contact_identifier_hash(value: str) -> str:
@@ -2568,12 +2646,23 @@ async def delete_user(
     user_id: str,
     current_user_id: str = Depends(get_current_user_id),
 ):
-    if current_user_id != user_id:
+    if current_user_id != user_id and not await _db_call(
+        _is_server_admin, current_user_id
+    ):
         raise HTTPException(status_code=403, detail="cannot delete another user")
     deleted = await _db_call(_delete_user, user_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="user not found")
     return {"status": "deleted"}
+
+
+@app.get("/admin/users", response_model=List[AdminUserPublic])
+async def list_users_as_admin(
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_is_server_admin, current_user_id):
+        raise HTTPException(status_code=403, detail="admin access required")
+    return await _db_call(_list_users_for_admin)
 
 
 @app.post("/users/{user_id}/push-token")
