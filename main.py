@@ -45,6 +45,9 @@ JWT_SECRET = os.environ.get("JWT_SECRET")  # set this in your shell
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRES_SECONDS = 60 * 60 * 24 * 365 * 10   # 7 days
 PASSWORD_RESET_EXPIRES_SECONDS = int(os.environ.get("PASSWORD_RESET_EXPIRES_SECONDS", "3600"))
+EMAIL_VERIFICATION_EXPIRES_SECONDS = int(
+    os.environ.get("EMAIL_VERIFICATION_EXPIRES_SECONDS", str(24 * 60 * 60))
+)
 PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://exclusionzone.org")
 GROUP_ICON_MAX_BYTES = max(
     1, int(os.environ.get("GROUP_ICON_MAX_BYTES", str(200 * 1024)))
@@ -581,6 +584,7 @@ def _init_db() -> None:
               phone TEXT,
               discoverable INTEGER NOT NULL DEFAULT 1,
               is_admin INTEGER NOT NULL DEFAULT 0,
+              email_verified INTEGER NOT NULL DEFAULT 0,
               password_hash TEXT NOT NULL,
               created_at REAL NOT NULL
             );
@@ -638,6 +642,16 @@ def _init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS password_reset_tokens (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              token_hash TEXT NOT NULL UNIQUE,
+              expires_at REAL NOT NULL,
+              used_at REAL,
+              created_at REAL NOT NULL,
+              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS email_verification_tokens (
               id TEXT PRIMARY KEY,
               user_id TEXT NOT NULL,
               token_hash TEXT NOT NULL UNIQUE,
@@ -786,6 +800,13 @@ def _init_db() -> None:
         except sqlite3.OperationalError:
             pass
 
+        # Existing accounts predate verification and remain usable. New email
+        # accounts explicitly start unverified in _create_user.
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+
         # Migration: allow NULL email and ensure unique phone
         try:
             columns = conn.execute("PRAGMA table_info(users)").fetchall()
@@ -801,12 +822,13 @@ def _init_db() -> None:
                         "phone TEXT UNIQUE, "
                         "discoverable INTEGER NOT NULL DEFAULT 1, "
                         "is_admin INTEGER NOT NULL DEFAULT 0, "
+                        "email_verified INTEGER NOT NULL DEFAULT 1, "
                         "password_hash TEXT NOT NULL, "
                         "created_at REAL NOT NULL)"
                     )
                     conn.execute(
-                        "INSERT INTO users_new(id, name, email, phone, discoverable, is_admin, password_hash, created_at) "
-                        "SELECT id, name, email, phone, discoverable, is_admin, password_hash, created_at FROM users"
+                        "INSERT INTO users_new(id, name, email, phone, discoverable, is_admin, email_verified, password_hash, created_at) "
+                        "SELECT id, name, email, phone, discoverable, is_admin, email_verified, password_hash, created_at FROM users"
                     )
                     conn.execute("DROP TABLE users")
                     conn.execute("ALTER TABLE users_new RENAME TO users")
@@ -830,15 +852,16 @@ def _init_db() -> None:
             ).fetchone()
             if existing_admin:
                 conn.execute(
-                    "UPDATE users SET is_admin = 1, password_hash = ? WHERE id = ?",
+                    "UPDATE users SET is_admin = 1, email_verified = 1, password_hash = ? WHERE id = ?",
                     (_hash_password(ADMIN_PASSWORD), existing_admin["id"]),
                 )
             else:
                 conn.execute(
                     """
                     INSERT INTO users(
-                      id, name, email, phone, discoverable, is_admin, password_hash, created_at
-                    ) VALUES (?, ?, ?, NULL, 0, 1, ?, ?)
+                      id, name, email, phone, discoverable, is_admin, email_verified,
+                      password_hash, created_at
+                    ) VALUES (?, ?, ?, NULL, 0, 1, 1, ?, ?)
                     """,
                     (
                         str(uuid.uuid4()),
@@ -1117,6 +1140,7 @@ class UserPublic(BaseModel):
     name: str
     email: Optional[EmailStr] = None
     phone: Optional[str] = None
+    email_verified: bool = True
 
 
 class AdminUserPublic(UserPublic):
@@ -1170,6 +1194,10 @@ class ForgotPasswordRequest(BaseModel):
 class PasswordResetRequest(BaseModel):
     token: str
     new_password: str
+
+
+class EmailVerificationRequest(BaseModel):
+    token: str
 
 
 class GpsTrailPoint(BaseModel):
@@ -1287,12 +1315,22 @@ def _create_user(
     try:
         with _get_conn() as conn:
             conn.execute(
-                "INSERT INTO users(id, name, email, phone, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, name, email, phone, password_hash, now),
+                """
+                INSERT INTO users(
+                  id, name, email, phone, email_verified, password_hash, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, name, email, phone, 0 if email else 1, password_hash, now),
             )
     except sqlite3.IntegrityError:
         raise ValueError("email_or_phone_exists")
-    return UserPublic(id=user_id, name=name, email=email, phone=phone)
+    return UserPublic(
+        id=user_id,
+        name=name,
+        email=email,
+        phone=phone,
+        email_verified=email is None,
+    )
 
 
 def _get_user_by_email(email: str) -> Optional[sqlite3.Row]:
@@ -1357,6 +1395,94 @@ def _send_password_reset_email(email: str, token: str) -> None:
             smtp.send_message(message)
     except (OSError, smtplib.SMTPException) as e:
         raise RuntimeError(f"SMTP password reset email failed: {e}") from e
+
+
+def _create_email_verification_token(email: str) -> Optional[str]:
+    row = _get_user_by_email(email)
+    if not row or row["email_verified"]:
+        return None
+
+    token = secrets.token_urlsafe(32)
+    token_hash = _hash_reset_token(token)
+    now = time.time()
+    with _get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE email_verification_tokens
+            SET used_at = ?
+            WHERE user_id = ? AND used_at IS NULL
+            """,
+            (now, row["id"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO email_verification_tokens(
+              id, user_id, token_hash, expires_at, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                row["id"],
+                token_hash,
+                now + EMAIL_VERIFICATION_EXPIRES_SECONDS,
+                now,
+            ),
+        )
+    return token
+
+
+def _build_email_verification_url(token: str) -> str:
+    encoded_token = urllib.parse.quote(token, safe="")
+    return f"{PUBLIC_APP_URL.rstrip('/')}/verify-email?token={encoded_token}"
+
+
+def _send_email_verification_email(email: str, token: str) -> None:
+    if not SMTP_HOST:
+        raise RuntimeError("SMTP_HOST is not set")
+
+    verification_url = _build_email_verification_url(token)
+    message = EmailMessage()
+    message["Subject"] = "Confirm your Commudus email"
+    message["From"] = SMTP_FROM
+    message["To"] = email
+    message.set_content(
+        "Confirm your email address using the link below. "
+        f"It expires in {EMAIL_VERIFICATION_EXPIRES_SECONDS // 3600} hours.\n\n"
+        f"{verification_url}\n"
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
+            smtp.starttls()
+            if SMTP_USERNAME and SMTP_PASSWORD:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException) as e:
+        raise RuntimeError(f"SMTP email verification failed: {e}") from e
+
+
+def _verify_email_with_token(token: str) -> bool:
+    token_hash = _hash_reset_token(token)
+    now = time.time()
+    with _get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT id, user_id FROM email_verification_tokens
+            WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?
+            """,
+            (token_hash, now),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute(
+            "UPDATE users SET email_verified = 1 WHERE id = ?",
+            (row["user_id"],),
+        )
+        conn.execute(
+            "UPDATE email_verification_tokens SET used_at = ? WHERE id = ?",
+            (now, row["id"]),
+        )
+        return True
 
 
 def _send_firebase_password_reset_email(email: str) -> str:
@@ -1433,7 +1559,10 @@ def _get_user_by_phone(phone: str) -> Optional[sqlite3.Row]:
 
 def _get_user_by_id(user_id: str) -> Optional[sqlite3.Row]:
     with _get_conn() as conn:
-        return conn.execute("SELECT id, name, email, phone FROM users WHERE id = ?", (user_id,)).fetchone()
+        return conn.execute(
+            "SELECT id, name, email, phone, email_verified FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
 
 
 def _is_server_admin(user_id: str) -> bool:
@@ -1448,7 +1577,7 @@ def _list_users_for_admin() -> List[dict]:
     with _get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT id, name, email, phone, is_admin, created_at
+            SELECT id, name, email, phone, is_admin, email_verified, created_at
             FROM users
             ORDER BY LOWER(name), created_at
             """
@@ -1460,6 +1589,7 @@ def _list_users_for_admin() -> List[dict]:
                 "email": row["email"],
                 "phone": row["phone"],
                 "is_admin": bool(row["is_admin"]),
+                "email_verified": bool(row["email_verified"]),
                 "created_at": row["created_at"],
             }
             for row in rows
@@ -1517,7 +1647,10 @@ def _update_user(
     phone: object,
 ) -> Optional[sqlite3.Row]:
     with _get_conn() as conn:
-        row = conn.execute("SELECT id, name, email, phone FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = conn.execute(
+            "SELECT id, name, email, phone, email_verified FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
         if not row:
             return None
         next_name = row["name"] if name is UNSET else name
@@ -1546,7 +1679,10 @@ def _update_user(
             )
         except sqlite3.IntegrityError:
             raise ValueError("email_or_phone_exists")
-        return conn.execute("SELECT id, name, email, phone FROM users WHERE id = ?", (user_id,)).fetchone()
+        return conn.execute(
+            "SELECT id, name, email, phone, email_verified FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
 
 
 def _delete_user(user_id: str) -> bool:
@@ -2560,7 +2696,7 @@ async def get_user(user_id: str):
     row = await _db_call(_get_user_by_id, user_id)
     if not row:
         raise HTTPException(status_code=404, detail="user not found")
-    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"]}
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"], "email_verified": bool(row["email_verified"])}
 
 
 @app.put("/users/{user_id}", response_model=UserPublic)
@@ -2600,7 +2736,7 @@ async def update_user(
         raise
     if not row:
         raise HTTPException(status_code=404, detail="user not found")
-    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"]}
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"], "email_verified": bool(row["email_verified"])}
 
 
 @app.get("/users/by-email/{email}", response_model=UserPublic)
@@ -2608,7 +2744,7 @@ async def get_user_by_email(email: EmailStr, current_user_id: str = Depends(get_
     row = await _db_call(_get_user_by_email, str(email))
     if not row:
         raise HTTPException(status_code=404, detail="user not found")
-    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"]}
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"], "email_verified": bool(row["email_verified"])}
 
 
 @app.put("/users/{user_id}/phone", response_model=UserPublic)
@@ -2637,7 +2773,7 @@ async def update_user_phone(
         raise
     if not row:
         raise HTTPException(status_code=404, detail="user not found")
-    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"]}
+    return {"id": row["id"], "name": row["name"], "email": row["email"], "phone": row["phone"], "email_verified": bool(row["email_verified"])}
 
 
 @app.delete("/users/{user_id}")
@@ -2681,6 +2817,11 @@ async def register_push_token(
 @app.post("/users", response_model=UserPublic)
 async def create_user(payload: UserCreate):
     email_value = str(payload.email).strip().lower() if payload.email is not None else None
+    if email_value and not SMTP_HOST:
+        raise HTTPException(
+            status_code=503,
+            detail="Email confirmation is not configured on the server",
+        )
     submitted_phone = payload.phone_number if payload.phone_number is not None else payload.phone
     phone_value = None
     if submitted_phone is not None:
@@ -2698,13 +2839,22 @@ async def create_user(payload: UserCreate):
         if existing:
             raise HTTPException(status_code=409, detail="phone already exists")
     try:
-        return await _db_call(
+        created_user = await _db_call(
             _create_user, payload.name, email_value, payload.password, phone_value
         )
     except ValueError as e:
         if str(e) == "email_or_phone_exists":
             raise HTTPException(status_code=409, detail="email or phone already exists")
         raise
+    if email_value:
+        verification_token = await _db_call(_create_email_verification_token, email_value)
+        try:
+            await asyncio.to_thread(
+                _send_email_verification_email, email_value, verification_token
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+    return created_user
 
 
 @app.post("/auth/login")
@@ -2727,6 +2877,8 @@ async def login(payload: "LoginRequest"):
         row = await _db_call(_get_user_by_phone, phone_value)
     if not row or not _verify_password(payload.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="invalid credentials")
+    if row["email"] and not row["email_verified"]:
+        raise HTTPException(status_code=403, detail="email not verified")
 
     token = _create_access_token(row["id"])
     return {"access_token": token, "token_type": "bearer"}
@@ -2763,6 +2915,95 @@ async def forgot_password(payload: ForgotPasswordRequest):
         )
     else:
         print(f"Password reset skipped for {email}: email not found in local users")
+    return {"status": "ok"}
+
+
+@app.post("/auth/resend-verification")
+async def resend_email_verification(payload: ForgotPasswordRequest):
+    email = str(payload.email).strip().lower()
+    row = await _db_call(_get_user_by_email, email)
+    if row and not row["email_verified"]:
+        if not SMTP_HOST:
+            raise HTTPException(
+                status_code=503,
+                detail="Email confirmation is not configured on the server",
+            )
+        token = await _db_call(_create_email_verification_token, email)
+        if token:
+            try:
+                await asyncio.to_thread(_send_email_verification_email, email, token)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=502, detail=str(exc))
+    # Do not reveal whether an email address has an account.
+    return {"status": "ok"}
+
+
+@app.get("/verify-email", response_class=HTMLResponse)
+async def verify_email_page(token: str = ""):
+    token_json = json.dumps(token)
+    return f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Confirm email</title>
+  <style>
+    body {{ margin: 0; min-height: 100vh; display: grid; place-items: center;
+      font-family: Arial, sans-serif; background: #f4f6f8; color: #17202a; }}
+    main {{ width: min(100% - 32px, 420px); padding: 28px; background: white;
+      border: 1px solid #d8dee4; border-radius: 8px; text-align: center; }}
+    button {{ min-height: 44px; padding: 0 20px; border: 0; border-radius: 6px;
+      background: #166534; color: white; font: inherit; font-weight: 700; cursor: pointer; }}
+    .error {{ color: #b42318; }} .success {{ color: #166534; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Confirm your email</h1>
+    <button id="confirm" type="button">Confirm email</button>
+    <p id="message" role="status" aria-live="polite"></p>
+  </main>
+  <script>
+    const token = {token_json};
+    const button = document.getElementById("confirm");
+    const message = document.getElementById("message");
+    if (!token) {{ button.disabled = true; message.className = "error";
+      message.textContent = "Verification token is missing."; }}
+    button.addEventListener("click", async () => {{
+      button.disabled = true;
+      message.className = "";
+      message.textContent = "Confirming...";
+      try {{
+        const response = await fetch("/auth/verify-email", {{
+          method: "POST", headers: {{"Content-Type": "application/json"}},
+          body: JSON.stringify({{token}})
+        }});
+        if (!response.ok) {{
+          const error = await response.json().catch(() => ({{detail: "Confirmation failed"}}));
+          throw new Error(error.detail || "Confirmation failed");
+        }}
+        message.className = "success";
+        message.textContent = "Email confirmed. You can now log in.";
+      }} catch (error) {{
+        message.className = "error";
+        message.textContent = error.message;
+        button.disabled = false;
+      }}
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
+@app.post("/auth/verify-email")
+async def verify_email(payload: EmailVerificationRequest):
+    if not payload.token.strip():
+        raise HTTPException(status_code=400, detail="token required")
+    verified = await _db_call(_verify_email_with_token, payload.token)
+    if not verified:
+        raise HTTPException(status_code=400, detail="invalid or expired verification token")
     return {"status": "ok"}
 
 
