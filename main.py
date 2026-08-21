@@ -962,7 +962,10 @@ def _init_db() -> None:
             # index already exists
             pass
 
-        _purge_empty_groups()
+    # Cleanup uses separate database connections and may write. Run it only
+    # after the schema/bootstrap transaction above has committed, otherwise
+    # SQLite waits on our own connection and reports "database is locked".
+    _purge_empty_groups()
 
 
 def _build_image_url(image_path: Optional[str]) -> Optional[str]:
