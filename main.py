@@ -1387,8 +1387,17 @@ def _send_email(message: EmailMessage) -> None:
                 [SENDMAIL_PATH, "-f", SMTP_FROM, "-t"],
                 input=message.as_bytes(),
                 check=True,
+                capture_output=True,
                 timeout=10,
             )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"Sendmail executable not found at {SENDMAIL_PATH}"
+            ) from exc
+        except subprocess.CalledProcessError as exc:
+            error_text = exc.stderr.decode("utf-8", errors="replace").strip()
+            detail = error_text or f"exit status {exc.returncode}"
+            raise RuntimeError(f"Sendmail rejected the email: {detail}") from exc
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError(f"Sendmail email delivery failed: {exc}") from exc
         return
