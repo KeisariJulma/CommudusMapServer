@@ -60,7 +60,9 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "localhost")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "25"))
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USERNAME or "no-reply@commudus-software.com")
+SMTP_FROM = os.environ.get(
+    "SMTP_FROM", "anttijussi.oksa@commudus-software.com"
+)
 SMTP_SECURITY = os.environ.get("SMTP_SECURITY", "none").strip().lower()
 EMAIL_TRANSPORT = os.environ.get("EMAIL_TRANSPORT", "sendmail").strip().lower()
 SENDMAIL_PATH = os.environ.get("SENDMAIL_PATH", "/usr/sbin/sendmail")
