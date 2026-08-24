@@ -3179,6 +3179,14 @@ async def reset_password_page(token: str = ""):
         message.className = "success";
         message.textContent = "Password updated.";
         form.reset();
+        window.setTimeout(() => {{
+          window.close();
+          window.setTimeout(() => {{
+            if (!window.closed) {{
+              message.textContent = "Password updated. You can close this page.";
+            }}
+          }}, 250);
+        }}, 350);
       }} catch (error) {{
         message.className = "error";
         message.textContent = error.message;
