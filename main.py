@@ -55,11 +55,12 @@ GROUP_ICON_MAX_BYTES = max(
 GROUP_ICON_MAX_DIMENSION = max(
     1, int(os.environ.get("GROUP_ICON_MAX_DIMENSION", "1024"))
 )
-SMTP_HOST = os.environ.get("SMTP_HOST")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_HOST = os.environ.get("SMTP_HOST", "localhost")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "25"))
 SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USERNAME or "no-reply@exclusionzone.org")
+SMTP_SECURITY = os.environ.get("SMTP_SECURITY", "none").strip().lower()
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 ADMIN_NAME = os.environ.get("ADMIN_NAME", "Administrator")
@@ -1376,11 +1377,28 @@ def _build_password_reset_url(token: str) -> str:
     return f"{PUBLIC_APP_URL.rstrip('/')}/reset-password?token={encoded_token}"
 
 
-def _send_password_reset_email(email: str, token: str) -> None:
-    reset_url = _build_password_reset_url(token)
+def _send_email(message: EmailMessage) -> None:
     if not SMTP_HOST:
         raise RuntimeError("SMTP_HOST is not set")
+    if SMTP_SECURITY not in {"none", "starttls", "ssl"}:
+        raise RuntimeError("SMTP_SECURITY must be one of: none, starttls, ssl")
+    if bool(SMTP_USERNAME) != bool(SMTP_PASSWORD):
+        raise RuntimeError("SMTP_USERNAME and SMTP_PASSWORD must be set together")
 
+    smtp_class = smtplib.SMTP_SSL if SMTP_SECURITY == "ssl" else smtplib.SMTP
+    try:
+        with smtp_class(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
+            if SMTP_SECURITY == "starttls":
+                smtp.starttls()
+            if SMTP_USERNAME:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+    except (OSError, smtplib.SMTPException) as exc:
+        raise RuntimeError(f"SMTP email delivery failed: {exc}") from exc
+
+
+def _send_password_reset_email(email: str, token: str) -> None:
+    reset_url = _build_password_reset_url(token)
     message = EmailMessage()
     message["Subject"] = "Reset your Commudus password"
     message["From"] = SMTP_FROM
@@ -1390,14 +1408,7 @@ def _send_password_reset_email(email: str, token: str) -> None:
         f"It expires in {PASSWORD_RESET_EXPIRES_SECONDS // 60} minutes.\n\n{reset_url}\n"
     )
 
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
-            smtp.starttls()
-            if SMTP_USERNAME and SMTP_PASSWORD:
-                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-            smtp.send_message(message)
-    except (OSError, smtplib.SMTPException) as e:
-        raise RuntimeError(f"SMTP password reset email failed: {e}") from e
+    _send_email(message)
 
 
 def _create_email_verification_token(email: str) -> Optional[str]:
@@ -1440,9 +1451,6 @@ def _build_email_verification_url(token: str) -> str:
 
 
 def _send_email_verification_email(email: str, token: str) -> None:
-    if not SMTP_HOST:
-        raise RuntimeError("SMTP_HOST is not set")
-
     verification_url = _build_email_verification_url(token)
     message = EmailMessage()
     message["Subject"] = "Confirm your Commudus email"
@@ -1454,14 +1462,7 @@ def _send_email_verification_email(email: str, token: str) -> None:
         f"{verification_url}\n"
     )
 
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
-            smtp.starttls()
-            if SMTP_USERNAME and SMTP_PASSWORD:
-                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
-            smtp.send_message(message)
-    except (OSError, smtplib.SMTPException) as e:
-        raise RuntimeError(f"SMTP email verification failed: {e}") from e
+    _send_email(message)
 
 
 def _verify_email_with_token(token: str) -> bool:
