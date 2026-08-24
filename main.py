@@ -21,6 +21,7 @@ import json
 import math
 import secrets
 import smtplib
+import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -61,6 +62,8 @@ SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM = os.environ.get("SMTP_FROM", SMTP_USERNAME or "no-reply@commudus-software.com")
 SMTP_SECURITY = os.environ.get("SMTP_SECURITY", "none").strip().lower()
+EMAIL_TRANSPORT = os.environ.get("EMAIL_TRANSPORT", "sendmail").strip().lower()
+SENDMAIL_PATH = os.environ.get("SENDMAIL_PATH", "/usr/sbin/sendmail")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 ADMIN_NAME = os.environ.get("ADMIN_NAME", "Administrator")
@@ -1378,6 +1381,20 @@ def _build_password_reset_url(token: str) -> str:
 
 
 def _send_email(message: EmailMessage) -> None:
+    if EMAIL_TRANSPORT == "sendmail":
+        try:
+            subprocess.run(
+                [SENDMAIL_PATH, "-f", SMTP_FROM, "-t"],
+                input=message.as_bytes(),
+                check=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"Sendmail email delivery failed: {exc}") from exc
+        return
+
+    if EMAIL_TRANSPORT != "smtp":
+        raise RuntimeError("EMAIL_TRANSPORT must be one of: sendmail, smtp")
     if not SMTP_HOST:
         raise RuntimeError("SMTP_HOST is not set")
     if SMTP_SECURITY not in {"none", "starttls", "ssl"}:
