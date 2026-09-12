@@ -21,11 +21,13 @@ import json
 import math
 import secrets
 import smtplib
+import ssl
 import subprocess
 import urllib.request
 import urllib.parse
 import urllib.error
 from email.message import EmailMessage
+from email.utils import formataddr
 
 from jose import jwt, JWTError
 import firebase_admin
@@ -56,15 +58,21 @@ GROUP_ICON_MAX_BYTES = max(
 GROUP_ICON_MAX_DIMENSION = max(
     1, int(os.environ.get("GROUP_ICON_MAX_DIMENSION", "1024"))
 )
-SMTP_HOST = os.environ.get("SMTP_HOST", "localhost")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "25"))
-SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
+SMTP_HOST = os.environ.get("SMTP_HOST", "mail.commudus-software.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USER", os.environ.get("SMTP_USERNAME", "noreply"))
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 SMTP_FROM = os.environ.get(
-    "SMTP_FROM", "anttijussi.oksa@commudus-software.com"
+    "SMTP_FROM", "noreply@commudus-software.com"
 )
-SMTP_SECURITY = os.environ.get("SMTP_SECURITY", "none").strip().lower()
-EMAIL_TRANSPORT = os.environ.get("EMAIL_TRANSPORT", "sendmail").strip().lower()
+SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", "Commodus Software")
+SMTP_SECURE = os.environ.get("SMTP_SECURE", "false").strip().lower() in {"true", "1", "yes"}
+SMTP_STARTTLS = os.environ.get("SMTP_STARTTLS", "true").strip().lower() in {"true", "1", "yes"}
+# Preserve the explicit security mode supported by existing deployments.
+SMTP_SECURITY = os.environ.get(
+    "SMTP_SECURITY", "ssl" if SMTP_SECURE else "starttls" if SMTP_STARTTLS else "none"
+).strip().lower()
+EMAIL_TRANSPORT = os.environ.get("EMAIL_TRANSPORT", "smtp").strip().lower()
 SENDMAIL_PATH = os.environ.get("SENDMAIL_PATH", "/usr/sbin/sendmail")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
@@ -1411,13 +1419,14 @@ def _send_email(message: EmailMessage) -> None:
     if SMTP_SECURITY not in {"none", "starttls", "ssl"}:
         raise RuntimeError("SMTP_SECURITY must be one of: none, starttls, ssl")
     if bool(SMTP_USERNAME) != bool(SMTP_PASSWORD):
-        raise RuntimeError("SMTP_USERNAME and SMTP_PASSWORD must be set together")
+        raise RuntimeError("SMTP_USER (or SMTP_USERNAME) and SMTP_PASSWORD must be set together")
 
     smtp_class = smtplib.SMTP_SSL if SMTP_SECURITY == "ssl" else smtplib.SMTP
     try:
-        with smtp_class(SMTP_HOST, SMTP_PORT, timeout=10) as smtp:
+        tls_options = {"context": ssl.create_default_context()} if SMTP_SECURITY == "ssl" else {}
+        with smtp_class(SMTP_HOST, SMTP_PORT, timeout=10, **tls_options) as smtp:
             if SMTP_SECURITY == "starttls":
-                smtp.starttls()
+                smtp.starttls(context=ssl.create_default_context())
             if SMTP_USERNAME:
                 smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
             smtp.send_message(message)
@@ -1429,7 +1438,7 @@ def _send_password_reset_email(email: str, token: str) -> None:
     reset_url = _build_password_reset_url(token)
     message = EmailMessage()
     message["Subject"] = "Reset your Commudus password"
-    message["From"] = SMTP_FROM
+    message["From"] = formataddr((SMTP_FROM_NAME, SMTP_FROM))
     message["To"] = email
     message.set_content(
         "Use this link to reset your password. "
@@ -1482,7 +1491,7 @@ def _send_email_verification_email(email: str, token: str) -> None:
     verification_url = _build_email_verification_url(token)
     message = EmailMessage()
     message["Subject"] = "Confirm your Commudus email"
-    message["From"] = SMTP_FROM
+    message["From"] = formataddr((SMTP_FROM_NAME, SMTP_FROM))
     message["To"] = email
     message.set_content(
         "Confirm your email address using the link below. "
