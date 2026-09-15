@@ -51,7 +51,7 @@ PASSWORD_RESET_EXPIRES_SECONDS = int(os.environ.get("PASSWORD_RESET_EXPIRES_SECO
 EMAIL_VERIFICATION_EXPIRES_SECONDS = int(
     os.environ.get("EMAIL_VERIFICATION_EXPIRES_SECONDS", str(24 * 60 * 60))
 )
-PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://exclusionzone.org")
+PUBLIC_APP_URL = os.environ.get("PUBLIC_APP_URL", "https://commudus-software.com")
 GROUP_ICON_MAX_BYTES = max(
     1, int(os.environ.get("GROUP_ICON_MAX_BYTES", str(200 * 1024)))
 )
