@@ -13,7 +13,7 @@ WorkingDirectory=/mnt/secret/servers/CommudusMapServer
 Environment=PORT=5656
 Environment="JWT_SECRET=be6e7de8de208840258f57a45979c078015a77fef9b2f7fd9eb01d1e642e07d1"
 Environment=PYTHONUNBUFFERED=1
-Environment=PUBLIC_APP_URL=https://exclusionzone.org
+Environment=PUBLIC_APP_URL=https://commudus-software.com
 Environment=FCM_SERVICE_ACCOUNT_FILE=/etc/commudusmap/fcm-service-account.json
 EnvironmentFile=-/etc/commudusmap/commudus-map-server.env
 
