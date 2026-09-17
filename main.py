@@ -1732,6 +1732,20 @@ def _delete_user(user_id: str) -> bool:
         return cursor.rowcount > 0
 
 
+def _delete_expired_unverified_users() -> int:
+    cutoff = time.time() - EMAIL_VERIFICATION_EXPIRES_SECONDS
+    with _get_conn() as conn:
+        cursor = conn.execute(
+            """
+            DELETE FROM users
+            WHERE email IS NOT NULL AND email_verified = 0
+              AND is_admin = 0 AND created_at <= ?
+            """,
+            (cutoff,),
+        )
+        return cursor.rowcount
+
+
 def _user_exists(user_id: str) -> bool:
     with _get_conn() as conn:
         return conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone() is not None
@@ -4054,6 +4068,17 @@ async def update_location(
 @app.on_event("startup")
 async def startup_event():
     await _db_call(_init_db)
+    await _db_call(_delete_expired_unverified_users)
+
+    async def cleanup_unverified_accounts():
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await _db_call(_delete_expired_unverified_users)
+            except sqlite3.Error as exc:
+                print(f"Unverified account cleanup failed: {exc}")
+
+    asyncio.create_task(cleanup_unverified_accounts())
 
     async def cleanup_inactive_users():
         while True:
