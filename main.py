@@ -3,7 +3,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, model_validator
 from typing import Dict, List, Optional
 from collections import deque
 import uvicorn
@@ -613,6 +613,23 @@ def _init_db() -> None:
               applied_at REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS points (
+              id TEXT PRIMARY KEY,
+              owner_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              label TEXT NOT NULL CHECK(length(label) BETWEEN 1 AND 80),
+              color TEXT NOT NULL,
+              latitude REAL NOT NULL CHECK(latitude BETWEEN -90 AND 90),
+              longitude REAL NOT NULL CHECK(longitude BETWEEN -180 AND 180),
+              version INTEGER NOT NULL DEFAULT 1,
+              updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS point_groups (
+              point_id TEXT NOT NULL REFERENCES points(id) ON DELETE CASCADE,
+              group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+              PRIMARY KEY (point_id, group_id)
+            );
+            CREATE INDEX IF NOT EXISTS point_groups_group_idx ON point_groups(group_id);
+
             CREATE TABLE IF NOT EXISTS group_members (
               group_id TEXT NOT NULL,
               user_id  TEXT NOT NULL,
@@ -1144,6 +1161,37 @@ async def _db_call(fn, *args, **kwargs):
 # -----------------------
 # Models
 # -----------------------
+class PointCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: str = Field(min_length=1, max_length=80)
+    color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+    latitude: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    longitude: float = Field(ge=-180, le=180, allow_inf_nan=False)
+
+
+class PointUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: int = Field(ge=1, strict=True)
+    label: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    color: Optional[str] = Field(default=None, pattern=r"^#[0-9A-Fa-f]{6}$")
+    latitude: Optional[float] = Field(default=None, ge=-90, le=90, allow_inf_nan=False)
+    longitude: Optional[float] = Field(default=None, ge=-180, le=180, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_changes(self):
+        changes = self.model_fields_set - {"version"}
+        if not changes or any(getattr(self, key) is None for key in changes):
+            raise ValueError("provide at least one non-null point field to update")
+        return self
+
+
+class PointPublic(PointCreate):
+    id: str
+    owner_user_id: str
+    version: int
+    updated_at: float
+
+
 class UserCreate(BaseModel):
     name: str
     email: Optional[EmailStr] = None
@@ -1749,6 +1797,96 @@ def _delete_expired_unverified_users() -> int:
 def _user_exists(user_id: str) -> bool:
     with _get_conn() as conn:
         return conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone() is not None
+
+
+def _point_operation(operation: str, user_id: str, point_id: str = "",
+                     group_id: str = "", payload=None):
+    with _get_conn() as conn:
+        # Serialize writes so ownership, membership and version checks use the
+        # same transaction as the mutation. Reads need only a consistent snapshot.
+        conn.execute("BEGIN" if operation in {"get", "list"} else "BEGIN IMMEDIATE")
+        if not conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+            raise HTTPException(status_code=401, detail="user no longer exists")
+        if operation == "create":
+            point_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO points VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+                (point_id, user_id, payload.label, payload.color,
+                 payload.latitude, payload.longitude, time.time()),
+            )
+        elif operation != "list":
+            point = conn.execute("SELECT * FROM points WHERE id = ?", (point_id,)).fetchone()
+            if point is None:
+                raise HTTPException(status_code=404, detail="point not found")
+            if point["owner_user_id"] != user_id:
+                if operation != "get":
+                    raise HTTPException(status_code=403, detail="only the creator can change this point")
+                visible = conn.execute(
+                    """SELECT 1 FROM point_groups pg JOIN group_members gm
+                       ON gm.group_id = pg.group_id
+                       WHERE pg.point_id = ? AND gm.user_id = ?""",
+                    (point_id, user_id),
+                ).fetchone()
+                if not visible:
+                    raise HTTPException(status_code=403, detail="point is not shared with you")
+        if operation in {"share", "list"}:
+            if not conn.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone():
+                raise HTTPException(status_code=404, detail="group not found")
+            if not conn.execute(
+                "SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?",
+                (group_id, user_id),
+            ).fetchone():
+                raise HTTPException(status_code=403, detail="not a member of this group")
+            if operation == "list":
+                return [dict(row) for row in conn.execute(
+                    """SELECT p.* FROM points p JOIN point_groups pg ON pg.point_id = p.id
+                       WHERE pg.group_id = ? ORDER BY p.id""", (group_id,),
+                ).fetchall()]
+            conn.execute("INSERT OR IGNORE INTO point_groups VALUES (?, ?)", (point_id, group_id))
+        elif operation == "update":
+            changes = payload.model_dump(exclude_unset=True, exclude={"version"})
+            assignments = ", ".join(f"{key} = ?" for key in changes)
+            cursor = conn.execute(
+                f"UPDATE points SET {assignments}, version = version + 1, updated_at = ? "
+                "WHERE id = ? AND owner_user_id = ? AND version = ?",
+                (*changes.values(), time.time(), point_id, user_id, payload.version),
+            )
+            if cursor.rowcount != 1:
+                raise HTTPException(status_code=409, detail="point version conflict; fetch the latest point")
+        elif operation == "delete":
+            conn.execute("DELETE FROM points WHERE id = ?", (point_id,))
+            return {"status": "deleted", "id": point_id}
+        return dict(conn.execute("SELECT * FROM points WHERE id = ?", (point_id,)).fetchone())
+
+
+@app.post("/points", response_model=PointPublic, status_code=201)
+async def create_point(payload: PointCreate, user_id: str = Depends(get_current_user_id)):
+    return await _db_call(_point_operation, "create", user_id, payload=payload)
+
+
+@app.post("/points/{point_id}/groups/{group_id}", response_model=PointPublic)
+async def share_point(point_id: str, group_id: str, user_id: str = Depends(get_current_user_id)):
+    return await _db_call(_point_operation, "share", user_id, point_id, group_id)
+
+
+@app.get("/groups/{group_id}/points", response_model=List[PointPublic])
+async def list_group_points(group_id: str, user_id: str = Depends(get_current_user_id)):
+    return await _db_call(_point_operation, "list", user_id, group_id=group_id)
+
+
+@app.get("/points/{point_id}", response_model=PointPublic)
+async def get_point(point_id: str, user_id: str = Depends(get_current_user_id)):
+    return await _db_call(_point_operation, "get", user_id, point_id)
+
+
+@app.patch("/points/{point_id}", response_model=PointPublic)
+async def update_point(point_id: str, payload: PointUpdate, user_id: str = Depends(get_current_user_id)):
+    return await _db_call(_point_operation, "update", user_id, point_id, payload=payload)
+
+
+@app.delete("/points/{point_id}")
+async def delete_point(point_id: str, user_id: str = Depends(get_current_user_id)):
+    return await _db_call(_point_operation, "delete", user_id, point_id)
 
 
 # -----------------------
