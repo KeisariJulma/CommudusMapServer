@@ -2335,6 +2335,28 @@ def _remove_member(group_id: str, user_id: str) -> int:
             "DELETE FROM group_members WHERE group_id = ? AND user_id = ?",
             (group_id, user_id),
         )
+        if cur.rowcount:
+            # Membership removal cascades to group_admins. Elect a successor in
+            # this same write transaction so concurrent departures serialize.
+            admin = conn.execute(
+                "SELECT user_id FROM group_admins WHERE group_id = ? ORDER BY RANDOM() LIMIT 1",
+                (group_id,),
+            ).fetchone()
+            if admin is None:
+                admin = conn.execute(
+                    "SELECT user_id FROM group_members WHERE group_id = ? ORDER BY RANDOM() LIMIT 1",
+                    (group_id,),
+                ).fetchone()
+                if admin is not None:
+                    conn.execute(
+                        "INSERT INTO group_admins(group_id, user_id) VALUES (?, ?)",
+                        (group_id, admin["user_id"]),
+                    )
+            if admin is not None:
+                conn.execute(
+                    "UPDATE groups SET owner_user_id = ? WHERE id = ? AND owner_user_id = ?",
+                    (admin["user_id"], group_id, user_id),
+                )
         return cur.rowcount
 
 
@@ -3530,12 +3552,6 @@ async def remove_user_from_group(
     target_is_admin = await _db_call(_is_group_admin, group_id, user_id)
     if not is_self_leave and target_is_admin and current_user_id != owner_id:
         raise HTTPException(status_code=403, detail="only group owner can remove admins")
-
-    # prevent owner leaving if others still exist
-    if is_self_leave and user_id == owner_id:
-        member_count = await _db_call(_count_members, group_id)
-        if member_count > 1:
-            raise HTTPException(status_code=400, detail="owner cannot leave while other members exist")
 
     removed = await _db_call(_remove_member, group_id, user_id)
     if removed == 0:
