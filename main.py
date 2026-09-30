@@ -2127,6 +2127,9 @@ def _list_user_groups(user_id: str) -> List[dict]:
                 "admin_user_ids": (
                     r["admin_user_ids"].split(",") if r["admin_user_ids"] else []
                 ),
+                "can_remove_admins": user_id in (
+                    r["admin_user_ids"].split(",") if r["admin_user_ids"] else []
+                ),
             }
             for r in rows
         ]
@@ -3612,7 +3615,11 @@ async def list_group_admins(
     if not await _db_call(_is_member, group_id, current_user_id):
         raise HTTPException(status_code=403, detail="not a member of this group")
     admin_ids = await _db_call(_list_admins, group_id)
-    return {"group_id": group_id, "admin_user_ids": admin_ids}
+    return {
+        "group_id": group_id,
+        "admin_user_ids": admin_ids,
+        "can_remove_admins": current_user_id in admin_ids,
+    }
 
 
 @app.post("/groups/{group_id}/admins/{user_id}")
@@ -3643,8 +3650,8 @@ async def remove_group_admin(
     owner_id = await _db_call(_get_group_owner_id, group_id)
     if not owner_id:
         raise HTTPException(status_code=404, detail="group not found")
-    if current_user_id != owner_id:
-        raise HTTPException(status_code=403, detail="only group owner can remove admins")
+    if not await _db_call(_is_group_admin, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="only group admins can remove admins")
     removed = await _db_call(_remove_group_admin, group_id, user_id)
     if removed == 0:
         raise HTTPException(status_code=404, detail="admin not found")
