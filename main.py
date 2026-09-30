@@ -2320,13 +2320,15 @@ def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict]) -> List[d
     return _list_group_passi_ajo_groups(group_id)
 
 
-def _add_member(group_id: str, user_id: str) -> None:
+def _add_member(group_id: str, user_id: str) -> bool:
     with _get_conn() as conn:
         conn.execute("INSERT OR IGNORE INTO groups(id) VALUES (?)", (group_id,))
-        conn.execute(
+        cur = conn.execute(
             "INSERT OR IGNORE INTO group_members(group_id, user_id) VALUES (?, ?)",
             (group_id, user_id),
         )
+        inserted = cur.rowcount > 0
+    return inserted
 
 
 def _remove_member(group_id: str, user_id: str) -> int:
@@ -2401,7 +2403,9 @@ def _get_share_enabled_member_ids(group_id: str) -> List[str]:
 def _add_push_token(user_id: str, token: str) -> None:
     with _get_conn() as conn:
         now = time.time()
-        conn.execute("DELETE FROM user_push_tokens WHERE user_id = ?", (user_id,))
+        # A device belongs to its most recently registered account; retain the
+        # user's other devices when registering this one.
+        conn.execute("DELETE FROM user_push_tokens WHERE token = ?", (token,))
         conn.execute(
             "INSERT OR IGNORE INTO user_push_tokens(user_id, token, created_at) VALUES (?, ?, ?)",
             (user_id, token, now),
@@ -2829,6 +2833,10 @@ def _send_fcm_push(tokens: List[str], title: str, body: str, data: dict) -> None
             message = firebase_messaging.Message(
                 token=token,
                 data=payload_data,
+                notification=(
+                    firebase_messaging.Notification(title=title, body=body)
+                    if payload_data.get("type") == "group_added" else None
+                ),
                 android=firebase_messaging.AndroidConfig(priority="high"),
             )
             firebase_messaging.send(message)
@@ -2841,6 +2849,26 @@ async def _send_fcm_push_async(tokens: List[str], title: str, body: str, data: d
         await asyncio.to_thread(_send_fcm_push, tokens, title, body, data)
     except Exception as exc:
         print("Failed to send FCM push:", exc)
+
+
+async def _notify_group_added(group_id: str, user_id: str) -> None:
+    """Send only after a new membership has committed, without creating chat history."""
+    if not FCM_SERVICE_ACCOUNT_FILE:
+        return
+    try:
+        tokens = await _db_call(_list_push_tokens, user_id)
+        if not tokens:
+            return
+        group_name = await _db_call(_get_group_name, group_id) or ""
+        await _send_fcm_push_async(
+            list(dict.fromkeys(tokens)),
+            "Sinut lisättiin ryhmään",
+            group_name or str(group_id),
+            {"type": "group_added", "group_id": str(group_id), "group_name": str(group_name)},
+        )
+    except Exception as exc:
+        # Delivery failure must not turn a committed membership into an API error.
+        print("Failed to send group membership push:", exc)
 
 
 # -----------------------
@@ -3477,8 +3505,10 @@ async def approve_join_request(
         raise HTTPException(status_code=403, detail="only group admins can approve requests")
     if not await _db_call(_user_exists, user_id):
         raise HTTPException(status_code=404, detail="user not found")
-    await _db_call(_add_member, group_id, user_id)
+    inserted = await _db_call(_add_member, group_id, user_id)
     await _db_call(_remove_join_request, group_id, user_id)
+    if inserted:
+        await _notify_group_added(group_id, user_id)
     return {"status": "approved", "group_id": group_id, "user_id": user_id}
 
 
@@ -3512,8 +3542,10 @@ async def add_user_to_group(
     if not owner_id:
         # legacy group without owner: allow self-join and claim ownership
         if current_user_id == user_id:
+            inserted = await _db_call(_add_member, group_id, user_id)
             await _db_call(_set_group_owner, group_id, current_user_id)
-            await _db_call(_add_member, group_id, user_id)
+            if inserted:
+                await _notify_group_added(group_id, user_id)
             return {"status": "ok", "group_id": group_id, "user_id": user_id}
         raise HTTPException(status_code=404, detail="group not found")
 
@@ -3525,7 +3557,9 @@ async def add_user_to_group(
     if not await _db_call(_user_exists, user_id):
         raise HTTPException(status_code=404, detail="user not found")
 
-    await _db_call(_add_member, group_id, user_id)
+    inserted = await _db_call(_add_member, group_id, user_id)
+    if inserted:
+        await _notify_group_added(group_id, user_id)
     return {"status": "ok", "group_id": group_id, "user_id": user_id}
 
 
