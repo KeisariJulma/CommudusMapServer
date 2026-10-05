@@ -713,6 +713,7 @@ def _init_db() -> None:
               group_id TEXT NOT NULL,
               user_id TEXT NOT NULL,
               body TEXT NOT NULL,
+              mentioned_user_ids_json TEXT NOT NULL DEFAULT '[]',
               image_path TEXT,
               image_lat REAL,
               image_lon REAL,
@@ -927,6 +928,9 @@ def _init_db() -> None:
         except sqlite3.OperationalError:
             # column already exists
             pass
+        message_columns = {row["name"] for row in conn.execute("PRAGMA table_info(group_messages)")}
+        if "mentioned_user_ids_json" not in message_columns:
+            conn.execute("ALTER TABLE group_messages ADD COLUMN mentioned_user_ids_json TEXT NOT NULL DEFAULT '[]'")
         # Migration: add image location columns to group_messages
         for stmt in (
             "ALTER TABLE group_messages ADD COLUMN image_lat REAL",
@@ -1360,6 +1364,7 @@ class PushTokenPayload(BaseModel):
 
 class ChatMessageCreate(BaseModel):
     body: Optional[str] = None
+    mentioned_user_ids: List[str] = Field(default_factory=list)
 
 
 class ChatMessagePublic(BaseModel):
@@ -1368,6 +1373,7 @@ class ChatMessagePublic(BaseModel):
     user_id: str
     username: str
     body: str
+    mentioned_user_ids: List[str] = Field(default_factory=list)
     created_at: float
     image_url: Optional[str] = None
     image_lat: Optional[float] = None
@@ -2545,7 +2551,7 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
             rows = conn.execute(
                 """
                 SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.image_path,
-                       gm.image_lat, gm.image_lon, gm.image_accuracy, gm.image_timestamp, gm.created_at
+                       gm.image_lat, gm.image_lon, gm.image_accuracy, gm.image_timestamp, gm.created_at, gm.mentioned_user_ids_json
                 FROM group_messages gm
                 JOIN users u ON u.id = gm.user_id
                 WHERE gm.group_id = ?
@@ -2558,7 +2564,7 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
             rows = conn.execute(
                 """
                 SELECT gm.id, gm.group_id, gm.user_id, u.name AS username, gm.body, gm.image_path,
-                       gm.image_lat, gm.image_lon, gm.image_accuracy, gm.image_timestamp, gm.created_at
+                       gm.image_lat, gm.image_lon, gm.image_accuracy, gm.image_timestamp, gm.created_at, gm.mentioned_user_ids_json
                 FROM group_messages gm
                 JOIN users u ON u.id = gm.user_id
                 WHERE gm.group_id = ? AND gm.created_at < ?
@@ -2574,6 +2580,7 @@ def _list_group_messages(group_id: str, limit: int = 50, before: Optional[float]
                 "user_id": r["user_id"],
                 "username": r["username"],
                 "body": r["body"],
+                "mentioned_user_ids": json.loads(r["mentioned_user_ids_json"]),
                 "image_path": r["image_path"],
                 "image_lat": r["image_lat"],
                 "image_lon": r["image_lon"],
@@ -2751,6 +2758,7 @@ def _add_group_message(
     image_lon: Optional[float] = None,
     image_accuracy: Optional[float] = None,
     image_timestamp: Optional[float] = None,
+    mentioned_user_ids: Optional[List[str]] = None,
 ) -> dict:
     created_at = time.time()
     with _get_conn() as conn:
@@ -2765,9 +2773,10 @@ def _add_group_message(
                 image_lon,
                 image_accuracy,
                 image_timestamp,
+                mentioned_user_ids_json,
                 created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 group_id,
@@ -2778,6 +2787,7 @@ def _add_group_message(
                 image_lon,
                 image_accuracy,
                 image_timestamp,
+                json.dumps(mentioned_user_ids or []),
                 created_at,
             ),
         )
@@ -2801,6 +2811,7 @@ def _add_group_message(
             "user_id": row["user_id"],
             "username": row["username"],
             "body": row["body"],
+            "mentioned_user_ids": mentioned_user_ids or [],
             "image_path": row["image_path"],
             "image_lat": row["image_lat"],
             "image_lon": row["image_lon"],
@@ -2872,7 +2883,7 @@ def _send_fcm_push(tokens: List[str], title: str, body: str, data: dict) -> None
                 data=payload_data,
                 notification=(
                     firebase_messaging.Notification(title=title, body=body)
-                    if payload_data.get("type") == "group_added" else None
+                    if payload_data.get("type") == "group_added" or payload_data.get("is_mention") == "true" else None
                 ),
                 android=firebase_messaging.AndroidConfig(priority="high"),
             )
@@ -4079,6 +4090,7 @@ async def create_group_message(
     if not await _db_call(_is_member, group_id, current_user_id):
         raise HTTPException(status_code=403, detail="not a member of this group")
     body = ""
+    raw_mentions = []
     image_path: Optional[str] = None
     image_lat: Optional[float] = None
     image_lon: Optional[float] = None
@@ -4087,6 +4099,10 @@ async def create_group_message(
     content_type = (request.headers.get("content-type") or "").lower()
     if content_type.startswith("multipart/form-data"):
         form = await request.form()
+        try:
+            raw_mentions = json.loads(str(form.get("mentioned_user_ids") or form.get("mentionedUserIds") or "[]"))
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="mentioned_user_ids must be a JSON array")
         raw_body = form.get("body")
         if isinstance(raw_body, str):
             body = raw_body.strip()
@@ -4114,6 +4130,13 @@ async def create_group_message(
             payload = {}
         if isinstance(payload, dict):
             body = str(payload.get("body") or "").strip()
+            raw_mentions = payload.get("mentioned_user_ids", payload.get("mentionedUserIds", []))
+    if not isinstance(raw_mentions, list) or any(not isinstance(uid, str) or not uid.strip() for uid in raw_mentions):
+        raise HTTPException(status_code=400, detail="mentioned_user_ids must be an array of user IDs")
+    mentioned_user_ids = list(dict.fromkeys(raw_mentions))
+    member_ids = await _db_call(_list_members, group_id)
+    if any(uid not in member_ids for uid in mentioned_user_ids):
+        raise HTTPException(status_code=400, detail="mentioned users must be group members")
     if not body and not image_path:
         raise HTTPException(status_code=400, detail="message body or image required")
     message = await _db_call(
@@ -4126,6 +4149,7 @@ async def create_group_message(
         image_lon,
         image_accuracy,
         image_timestamp,
+        mentioned_user_ids,
     )
     image_url = _build_image_url(message.get("image_path"))
     message.pop("image_path", None)
@@ -4135,9 +4159,11 @@ async def create_group_message(
         member_ids = await _db_call(_list_members, group_id)
         target_ids = [uid for uid in member_ids if uid != current_user_id]
         tokens: List[str] = []
+        mention_tokens: List[str] = []
         for uid in target_ids:
-            tokens.extend(await _db_call(_list_push_tokens, uid))
-        if tokens:
+            user_tokens = await _db_call(_list_push_tokens, uid)
+            (mention_tokens if uid in mentioned_user_ids else tokens).extend(user_tokens)
+        if tokens or mention_tokens:
             deduped = list(dict.fromkeys(tokens))
             body_text = (message.get("body") or "").strip()
             body_preview = body_text[:80] if body_text else ("Kuva" if image_url else "")
@@ -4151,10 +4177,17 @@ async def create_group_message(
                 "message_id": str(message["id"]),
                 "body_preview": body_preview,
                 "body": message["body"],
+                "mentioned_user_ids": json.dumps(mentioned_user_ids),
             }
             asyncio.create_task(
                 _send_fcm_push_async(deduped, message["username"], body_preview, data)
             )
+            if mention_tokens:
+                asyncio.create_task(_send_fcm_push_async(
+                    list(dict.fromkeys(mention_tokens)),
+                    f'{message["username"]} mainitsi sinut', body_preview,
+                    {**data, "is_mention": "true"},
+                ))
     return {
         **message,
         "image_url": image_url,
