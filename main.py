@@ -372,11 +372,26 @@ def _normalize_passi_line_payload(value: object, index: int) -> Optional[dict]:
         raw_coordinates = geometry.get("coordinates") if isinstance(geometry, dict) else []
     if not isinstance(raw_coordinates, list):
         raw_coordinates = []
-    coordinates = [
-        coordinate
-        for raw_coordinate in raw_coordinates
-        if (coordinate := _parse_coordinate_pair(raw_coordinate)) is not None
-    ]
+    coordinates = []
+    assignments = {}
+    raw_assignments = value.get("assignments")
+    for original_index, raw_coordinate in enumerate(raw_coordinates):
+        coordinate = _parse_coordinate_pair(raw_coordinate)
+        if coordinate is None:
+            continue
+        normalized_index = len(coordinates)
+        coordinates.append(coordinate)
+        assignment = raw_assignments.get(str(original_index)) if isinstance(raw_assignments, dict) else None
+        if not isinstance(assignment, dict):
+            continue
+        user_id = assignment.get("userId")
+        if not isinstance(user_id, str) or not user_id.strip():
+            continue
+        name = assignment.get("name")
+        assignments[str(normalized_index)] = {
+            "userId": user_id,
+            "name": name if isinstance(name, str) and name.strip() else user_id,
+        }
     if not coordinates:
         return None
     raw_created_at = value.get("createdAt")
@@ -387,6 +402,7 @@ def _normalize_passi_line_payload(value: object, index: int) -> Optional[dict]:
         "id": str(value.get("id") or f"passi-line-{index + 1}"),
         "name": str(value.get("name") or f"Linja {index + 1}"),
         "coordinates": coordinates,
+        "assignments": assignments,
         "createdAt": int(created_at) if created_at is not None else int(time.time() * 1000),
         "position": index,
     }
@@ -745,6 +761,7 @@ def _init_db() -> None:
               id TEXT NOT NULL,
               name TEXT NOT NULL,
               coordinates_json TEXT NOT NULL,
+              assignments_json TEXT NOT NULL DEFAULT '{}',
               created_at INTEGER NOT NULL,
               position INTEGER NOT NULL,
               PRIMARY KEY (group_id, ajo_group_id, id),
@@ -928,6 +945,10 @@ def _init_db() -> None:
         except sqlite3.OperationalError:
             # column already exists
             pass
+
+        line_columns = {row["name"] for row in conn.execute("PRAGMA table_info(group_passi_ajo_lines)")}
+        if "assignments_json" not in line_columns:
+            conn.execute("ALTER TABLE group_passi_ajo_lines ADD COLUMN assignments_json TEXT NOT NULL DEFAULT '{}'")
 
 
         # Optional: index for owner lookups
@@ -1308,10 +1329,16 @@ class PassipaikkaListPublic(BaseModel):
     points: List[PassipaikkaPublic]
 
 
+class PassiPointAssignmentPublic(BaseModel):
+    userId: str
+    name: str
+
+
 class PassiLinePublic(BaseModel):
     id: str
     name: str
     coordinates: List[List[float]]
+    assignments: Dict[str, PassiPointAssignmentPublic] = Field(default_factory=dict)
     createdAt: int
 
 
@@ -2232,7 +2259,7 @@ def _list_group_passi_ajo_groups(group_id: str) -> List[dict]:
         ).fetchall()
         line_rows = conn.execute(
             """
-            SELECT ajo_group_id, id, name, coordinates_json, created_at
+            SELECT ajo_group_id, id, name, coordinates_json, assignments_json, created_at
             FROM group_passi_ajo_lines
             WHERE group_id = ?
             ORDER BY ajo_group_id, position, created_at, id
@@ -2246,11 +2273,16 @@ def _list_group_passi_ajo_groups(group_id: str) -> List[dict]:
             coordinates = json.loads(row["coordinates_json"])
         except json.JSONDecodeError:
             coordinates = []
+        try:
+            assignments = json.loads(row["assignments_json"])
+        except json.JSONDecodeError:
+            assignments = {}
         lines_by_group.setdefault(row["ajo_group_id"], []).append(
             {
                 "id": row["id"],
                 "name": row["name"],
                 "coordinates": coordinates if isinstance(coordinates, list) else [],
+                "assignments": assignments if isinstance(assignments, dict) else {},
                 "createdAt": int(row["created_at"]),
             }
         )
@@ -2302,10 +2334,11 @@ def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict]) -> List[d
                     id,
                     name,
                     coordinates_json,
+                    assignments_json,
                     created_at,
                     position
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -2314,6 +2347,7 @@ def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict]) -> List[d
                         line["id"],
                         line["name"],
                         json.dumps(line["coordinates"], separators=(",", ":")),
+                        json.dumps(line.get("assignments", {}), separators=(",", ":")),
                         line["createdAt"],
                         line["position"],
                     )
