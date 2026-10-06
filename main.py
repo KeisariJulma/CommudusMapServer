@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from contextlib import nullcontext
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.staticfiles import StaticFiles
@@ -444,7 +445,8 @@ def _normalize_passi_ajo_group_payload(value: object, index: int) -> Optional[di
                 or not hunt["startedBy"].strip()):
             raise HTTPException(status_code=400, detail="invalid hunt metadata")
         hunt = {"startedAt": hunt["startedAt"], "startedBy": hunt["startedBy"]}
-        selected_line_id = ""
+    if selected_line_id not in (None, "") and selected_line_id not in seen_line_ids:
+        raise HTTPException(status_code=400, detail="selectedLineId must belong to this Ajo")
     return {
         "id": str(value.get("id") or f"passi-ajo-group-{index + 1}"),
         "name": str(value.get("name") or f"Passiajo {index + 1}"),
@@ -2282,9 +2284,10 @@ def _replace_group_passipaikat(group_id: str, points: List[dict]) -> dict:
         return _format_passipaikka_list(group["id"], group["name"], rows)
 
 
-def _list_group_passi_ajo_groups(group_id: str, include_revision: bool = False):
-    with _get_conn() as conn:
-        conn.execute("BEGIN")
+def _list_group_passi_ajo_groups(group_id: str, include_revision: bool = False, connection=None):
+    with nullcontext(connection) if connection is not None else _get_conn() as conn:
+        if connection is None:
+            conn.execute("BEGIN")
         if not conn.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone():
             raise ValueError("group_not_found")
         revision = conn.execute("SELECT passilinjat_revision FROM groups WHERE id = ?", (group_id,)).fetchone()[0]
@@ -2342,7 +2345,12 @@ def _list_group_passi_ajo_groups(group_id: str, include_revision: bool = False):
     return {"groups": groups, "revision": revision} if include_revision else groups
 
 
-def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict], user_id: str, revision: int):
+def _passilinjat_response(snapshot: dict):
+    return JSONResponse(snapshot, headers={"ETag": f'"{snapshot["revision"]}"', "Cache-Control": "no-store"})
+
+
+def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict], user_id: str,
+                                   revision: Optional[int], if_match: Optional[str] = None):
     with _get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         if not conn.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone():
@@ -2351,10 +2359,14 @@ def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict], user_id: 
             raise HTTPException(status_code=403, detail="not a member of this group")
         if not conn.execute("SELECT 1 FROM groups WHERE id = ? AND (owner_user_id = ? OR EXISTS (SELECT 1 FROM group_admins WHERE group_id = ? AND user_id = ?))", (group_id, user_id, group_id, user_id)).fetchone():
             raise HTTPException(status_code=403, detail="group owner or admin required")
-        if type(revision) is not int or revision < 0:
+        if revision is None and if_match is None:
             raise HTTPException(status_code=428, detail="passilinjat revision required; GET latest state before PUT")
+        if revision is not None and (type(revision) is not int or revision < 0):
+            raise HTTPException(status_code=400, detail="revision must be a nonnegative integer")
         current = conn.execute("SELECT passilinjat_revision FROM groups WHERE id = ?", (group_id,)).fetchone()[0]
-        if revision != current:
+        if if_match is not None and f'"{current}"' not in [tag.strip() for tag in if_match.split(",")]:
+            raise HTTPException(status_code=412, detail="passilinjat ETag conflict; fetch latest state and reapply edits")
+        if revision is not None and revision != current:
             raise HTTPException(status_code=409, detail="passilinjat revision conflict; fetch latest state and reapply edits")
         active = [group for group in groups if group.get("hunt") is not None]
         if len(active) > 1:
@@ -2424,7 +2436,8 @@ def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict], user_id: 
                 ],
             )
         conn.execute("UPDATE groups SET passilinjat_revision = passilinjat_revision + 1 WHERE id = ?", (group_id,))
-    return _list_group_passi_ajo_groups(group_id, True)
+        snapshot = _list_group_passi_ajo_groups(group_id, True, conn)
+    return snapshot
 
 
 def _add_member(group_id: str, user_id: str) -> bool:
@@ -3965,7 +3978,7 @@ async def get_passi_ajo_groups(
         raise HTTPException(status_code=404, detail="group not found")
     if not await _db_call(_is_member, group_id, current_user_id):
         raise HTTPException(status_code=403, detail="not a member of this group")
-    return await _db_call(_list_group_passi_ajo_groups, group_id, True)
+    return _passilinjat_response(await _db_call(_list_group_passi_ajo_groups, group_id, True))
 
 
 @app.put("/groups/{group_id}/passi-ajo-groups", response_model=PassilinjatPublic, response_model_exclude_none=True)
@@ -3983,8 +3996,11 @@ async def save_passi_ajo_groups(
     except Exception:
         raise HTTPException(status_code=400, detail="invalid json body")
     groups = _extract_passi_ajo_groups_payload(payload)
-    return await _db_call(_replace_group_passi_ajo_groups, group_id, groups, current_user_id,
-                          payload.get("revision") if isinstance(payload, dict) else None)
+    return _passilinjat_response(await _db_call(
+        _replace_group_passi_ajo_groups, group_id, groups, current_user_id,
+        payload.get("revision") if isinstance(payload, dict) else None,
+        request.headers.get("if-match"),
+    ))
 
 
 @app.get("/passilinjat/groups")
@@ -4008,7 +4024,7 @@ async def get_selected_group_passilinjat(
         raise HTTPException(status_code=403, detail="not a member of this group")
     snapshot = await _db_call(_list_group_passi_ajo_groups, group_id, True)
     group_name = await _db_call(_get_group_name, group_id)
-    return {"group_id": group_id, "group_name": group_name, **snapshot}
+    return _passilinjat_response({"group_id": group_id, "group_name": group_name, **snapshot})
 
 
 @app.put("/passilinjat")
@@ -4038,13 +4054,14 @@ async def save_selected_group_passilinjat(
     saved_groups = await _db_call(
         _replace_group_passi_ajo_groups, selected_group_id, groups, current_user_id,
         payload.get("revision") if isinstance(payload, dict) else None,
+        request.headers.get("if-match"),
     )
     group_name = await _db_call(_get_group_name, selected_group_id)
-    return {
+    return _passilinjat_response({
         "group_id": selected_group_id,
         "group_name": group_name,
         **saved_groups,
-    }
+    })
 
 
 @app.get("/groups/{group_id}/passilinjat", response_model=PassilinjatPublic, response_model_exclude_none=True)
@@ -4319,6 +4336,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["ETag"],
 )
 
 # -----------------------
