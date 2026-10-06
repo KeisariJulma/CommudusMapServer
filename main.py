@@ -20,6 +20,7 @@ import hmac
 import json
 import math
 import secrets
+import re
 import smtplib
 import ssl
 import subprocess
@@ -403,6 +404,7 @@ def _normalize_passi_line_payload(value: object, index: int) -> Optional[dict]:
         "name": str(value.get("name") or f"Linja {index + 1}"),
         "coordinates": coordinates,
         "assignments": assignments,
+        "color": value["color"].upper() if isinstance(value.get("color"), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", value["color"]) else "#C084FC",
         "createdAt": int(created_at) if created_at is not None else int(time.time() * 1000),
         "position": index,
     }
@@ -435,11 +437,20 @@ def _normalize_passi_ajo_group_payload(value: object, index: int) -> Optional[di
     selected_line_id = value.get("selectedLineId")
     if selected_line_id is None:
         selected_line_id = value.get("selected_line_id")
+    hunt = value.get("hunt")
+    if hunt is not None:
+        if (not isinstance(hunt, dict) or type(hunt.get("startedAt")) is not int
+                or hunt["startedAt"] <= 0 or not isinstance(hunt.get("startedBy"), str)
+                or not hunt["startedBy"].strip()):
+            raise HTTPException(status_code=400, detail="invalid hunt metadata")
+        hunt = {"startedAt": hunt["startedAt"], "startedBy": hunt["startedBy"]}
+        selected_line_id = ""
     return {
         "id": str(value.get("id") or f"passi-ajo-group-{index + 1}"),
         "name": str(value.get("name") or f"Passiajo {index + 1}"),
         "lines": lines,
         "selectedLineId": str(selected_line_id) if selected_line_id is not None else None,
+        **({"hunt": hunt} if hunt is not None else {}),
         "createdAt": int(created_at) if created_at is not None else int(time.time() * 1000),
         "position": index,
     }
@@ -951,6 +962,15 @@ def _init_db() -> None:
             pass
 
         line_columns = {row["name"] for row in conn.execute("PRAGMA table_info(group_passi_ajo_lines)")}
+        if "color" not in line_columns:
+            conn.execute("ALTER TABLE group_passi_ajo_lines ADD COLUMN color TEXT NOT NULL DEFAULT '#C084FC'")
+        ajo_columns = {row["name"] for row in conn.execute("PRAGMA table_info(group_passi_ajo_groups)")}
+        if "hunt_json" not in ajo_columns:
+            conn.execute("ALTER TABLE group_passi_ajo_groups ADD COLUMN hunt_json TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS one_active_group_hunt ON group_passi_ajo_groups(group_id) WHERE hunt_json IS NOT NULL")
+        group_columns = {row["name"] for row in conn.execute("PRAGMA table_info(groups)")}
+        if "passilinjat_revision" not in group_columns:
+            conn.execute("ALTER TABLE groups ADD COLUMN passilinjat_revision INTEGER NOT NULL DEFAULT 0")
         if "assignments_json" not in line_columns:
             conn.execute("ALTER TABLE group_passi_ajo_lines ADD COLUMN assignments_json TEXT NOT NULL DEFAULT '{}'")
 
@@ -1344,6 +1364,12 @@ class PassiLinePublic(BaseModel):
     coordinates: List[List[float]]
     assignments: Dict[str, PassiPointAssignmentPublic] = Field(default_factory=dict)
     createdAt: int
+    color: str = "#C084FC"
+
+
+class PassiHuntPublic(BaseModel):
+    startedAt: int
+    startedBy: str
 
 
 class PassiAjoGroupPublic(BaseModel):
@@ -1352,10 +1378,16 @@ class PassiAjoGroupPublic(BaseModel):
     lines: List[PassiLinePublic]
     selectedLineId: Optional[str] = None
     createdAt: int
+    hunt: Optional[PassiHuntPublic] = None
 
 
 class ShareUpdate(BaseModel):
     enabled: bool
+
+
+class PassilinjatPublic(BaseModel):
+    groups: List[PassiAjoGroupPublic]
+    revision: int
 
 
 class PushTokenPayload(BaseModel):
@@ -2250,13 +2282,15 @@ def _replace_group_passipaikat(group_id: str, points: List[dict]) -> dict:
         return _format_passipaikka_list(group["id"], group["name"], rows)
 
 
-def _list_group_passi_ajo_groups(group_id: str) -> List[dict]:
+def _list_group_passi_ajo_groups(group_id: str, include_revision: bool = False):
     with _get_conn() as conn:
+        conn.execute("BEGIN")
         if not conn.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone():
             raise ValueError("group_not_found")
+        revision = conn.execute("SELECT passilinjat_revision FROM groups WHERE id = ?", (group_id,)).fetchone()[0]
         group_rows = conn.execute(
             """
-            SELECT id, name, selected_line_id, created_at
+            SELECT id, name, selected_line_id, created_at, hunt_json
             FROM group_passi_ajo_groups
             WHERE group_id = ?
             ORDER BY position, created_at, id
@@ -2265,7 +2299,7 @@ def _list_group_passi_ajo_groups(group_id: str) -> List[dict]:
         ).fetchall()
         line_rows = conn.execute(
             """
-            SELECT ajo_group_id, id, name, coordinates_json, assignments_json, created_at
+            SELECT ajo_group_id, id, name, coordinates_json, assignments_json, created_at, color
             FROM group_passi_ajo_lines
             WHERE group_id = ?
             ORDER BY ajo_group_id, position, created_at, id
@@ -2290,25 +2324,50 @@ def _list_group_passi_ajo_groups(group_id: str) -> List[dict]:
                 "coordinates": coordinates if isinstance(coordinates, list) else [],
                 "assignments": assignments if isinstance(assignments, dict) else {},
                 "createdAt": int(row["created_at"]),
+                "color": row["color"],
             }
         )
 
-    return [
+    groups = [
         {
             "id": row["id"],
             "name": row["name"],
             "lines": lines_by_group.get(row["id"], []),
             "selectedLineId": row["selected_line_id"],
             "createdAt": int(row["created_at"]),
+            **({"hunt": json.loads(row["hunt_json"])} if row["hunt_json"] is not None else {}),
         }
         for row in group_rows
     ]
+    return {"groups": groups, "revision": revision} if include_revision else groups
 
 
-def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict]) -> List[dict]:
+def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict], user_id: str, revision: int):
     with _get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         if not conn.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone():
             raise ValueError("group_not_found")
+        if not conn.execute("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, user_id)).fetchone():
+            raise HTTPException(status_code=403, detail="not a member of this group")
+        if not conn.execute("SELECT 1 FROM groups WHERE id = ? AND (owner_user_id = ? OR EXISTS (SELECT 1 FROM group_admins WHERE group_id = ? AND user_id = ?))", (group_id, user_id, group_id, user_id)).fetchone():
+            raise HTTPException(status_code=403, detail="group owner or admin required")
+        if type(revision) is not int or revision < 0:
+            raise HTTPException(status_code=428, detail="passilinjat revision required; GET latest state before PUT")
+        current = conn.execute("SELECT passilinjat_revision FROM groups WHERE id = ?", (group_id,)).fetchone()[0]
+        if revision != current:
+            raise HTTPException(status_code=409, detail="passilinjat revision conflict; fetch latest state and reapply edits")
+        active = [group for group in groups if group.get("hunt") is not None]
+        if len(active) > 1:
+            raise HTTPException(status_code=400, detail="only one active hunt per group")
+        for group in active:
+            hunt = group["hunt"]
+            old = conn.execute("SELECT hunt_json FROM group_passi_ajo_groups WHERE group_id = ? AND id = ?", (group_id, group["id"])).fetchone()
+            unchanged = old is not None and old[0] is not None and json.loads(old[0]) == hunt
+            initiator = hunt["startedBy"]
+            if not unchanged and initiator != user_id:
+                raise HTTPException(status_code=400, detail="hunt startedBy must match initiating admin")
+            if not unchanged and not conn.execute("SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?", (group_id, initiator)).fetchone():
+                raise HTTPException(status_code=400, detail="hunt initiator must be a member")
         conn.execute("DELETE FROM group_passi_ajo_groups WHERE group_id = ?", (group_id,))
         for group in groups:
             conn.execute(
@@ -2318,16 +2377,18 @@ def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict]) -> List[d
                     id,
                     name,
                     selected_line_id,
+                    hunt_json,
                     created_at,
                     position
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     group_id,
                     group["id"],
                     group["name"],
                     group["selectedLineId"],
+                    json.dumps(group["hunt"]) if group.get("hunt") is not None else None,
                     group["createdAt"],
                     group["position"],
                 ),
@@ -2341,10 +2402,11 @@ def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict]) -> List[d
                     name,
                     coordinates_json,
                     assignments_json,
+                    color,
                     created_at,
                     position
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -2354,13 +2416,15 @@ def _replace_group_passi_ajo_groups(group_id: str, groups: List[dict]) -> List[d
                         line["name"],
                         json.dumps(line["coordinates"], separators=(",", ":")),
                         json.dumps(line.get("assignments", {}), separators=(",", ":")),
+                        line.get("color", "#C084FC"),
                         line["createdAt"],
                         line["position"],
                     )
                     for line in group["lines"]
                 ],
             )
-    return _list_group_passi_ajo_groups(group_id)
+        conn.execute("UPDATE groups SET passilinjat_revision = passilinjat_revision + 1 WHERE id = ?", (group_id,))
+    return _list_group_passi_ajo_groups(group_id, True)
 
 
 def _add_member(group_id: str, user_id: str) -> bool:
@@ -3892,7 +3956,7 @@ async def sync_group_passipaikat(
     return {"lists": [passipaikka_list]}
 
 
-@app.get("/groups/{group_id}/passi-ajo-groups", response_model=Dict[str, List[PassiAjoGroupPublic]])
+@app.get("/groups/{group_id}/passi-ajo-groups", response_model=PassilinjatPublic, response_model_exclude_none=True)
 async def get_passi_ajo_groups(
     group_id: str,
     current_user_id: str = Depends(get_current_user_id),
@@ -3901,11 +3965,10 @@ async def get_passi_ajo_groups(
         raise HTTPException(status_code=404, detail="group not found")
     if not await _db_call(_is_member, group_id, current_user_id):
         raise HTTPException(status_code=403, detail="not a member of this group")
-    groups = await _db_call(_list_group_passi_ajo_groups, group_id)
-    return {"groups": groups}
+    return await _db_call(_list_group_passi_ajo_groups, group_id, True)
 
 
-@app.put("/groups/{group_id}/passi-ajo-groups", response_model=Dict[str, List[PassiAjoGroupPublic]])
+@app.put("/groups/{group_id}/passi-ajo-groups", response_model=PassilinjatPublic, response_model_exclude_none=True)
 async def save_passi_ajo_groups(
     group_id: str,
     request: Request,
@@ -3920,8 +3983,8 @@ async def save_passi_ajo_groups(
     except Exception:
         raise HTTPException(status_code=400, detail="invalid json body")
     groups = _extract_passi_ajo_groups_payload(payload)
-    saved_groups = await _db_call(_replace_group_passi_ajo_groups, group_id, groups)
-    return {"groups": saved_groups}
+    return await _db_call(_replace_group_passi_ajo_groups, group_id, groups, current_user_id,
+                          payload.get("revision") if isinstance(payload, dict) else None)
 
 
 @app.get("/passilinjat/groups")
@@ -3943,9 +4006,9 @@ async def get_selected_group_passilinjat(
         raise HTTPException(status_code=404, detail="group not found")
     if not await _db_call(_is_member, group_id, current_user_id):
         raise HTTPException(status_code=403, detail="not a member of this group")
-    groups = await _db_call(_list_group_passi_ajo_groups, group_id)
+    snapshot = await _db_call(_list_group_passi_ajo_groups, group_id, True)
     group_name = await _db_call(_get_group_name, group_id)
-    return {"group_id": group_id, "group_name": group_name, "groups": groups}
+    return {"group_id": group_id, "group_name": group_name, **snapshot}
 
 
 @app.put("/passilinjat")
@@ -3973,17 +4036,18 @@ async def save_selected_group_passilinjat(
 
     groups = _extract_passi_ajo_groups_payload(payload)
     saved_groups = await _db_call(
-        _replace_group_passi_ajo_groups, selected_group_id, groups
+        _replace_group_passi_ajo_groups, selected_group_id, groups, current_user_id,
+        payload.get("revision") if isinstance(payload, dict) else None,
     )
     group_name = await _db_call(_get_group_name, selected_group_id)
     return {
         "group_id": selected_group_id,
         "group_name": group_name,
-        "groups": saved_groups,
+        **saved_groups,
     }
 
 
-@app.get("/groups/{group_id}/passilinjat", response_model=Dict[str, List[PassiAjoGroupPublic]])
+@app.get("/groups/{group_id}/passilinjat", response_model=PassilinjatPublic, response_model_exclude_none=True)
 async def get_passilinjat(
     group_id: str,
     current_user_id: str = Depends(get_current_user_id),
@@ -3991,7 +4055,7 @@ async def get_passilinjat(
     return await get_passi_ajo_groups(group_id, current_user_id)
 
 
-@app.put("/groups/{group_id}/passilinjat", response_model=Dict[str, List[PassiAjoGroupPublic]])
+@app.put("/groups/{group_id}/passilinjat", response_model=PassilinjatPublic, response_model_exclude_none=True)
 async def save_passilinjat(
     group_id: str,
     request: Request,
