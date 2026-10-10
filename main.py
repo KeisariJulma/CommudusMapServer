@@ -445,6 +445,7 @@ def _normalize_passi_ajo_group_payload(value: object, index: int) -> Optional[di
                 or not hunt["startedBy"].strip()):
             raise HTTPException(status_code=400, detail="invalid hunt metadata")
         hunt = {"startedAt": hunt["startedAt"], "startedBy": hunt["startedBy"]}
+    # JSON null means "Ei mitään": persist no selected line, including during hunts.
     if selected_line_id not in (None, "") and selected_line_id not in seen_line_ids:
         raise HTTPException(status_code=400, detail="selectedLineId must belong to this Ajo")
     return {
