@@ -2194,7 +2194,7 @@ def _list_user_groups(user_id: str) -> List[dict]:
                 "admin_user_ids": (
                     r["admin_user_ids"].split(",") if r["admin_user_ids"] else []
                 ),
-                "can_remove_admins": user_id in (
+                "can_remove_admins": user_id == r["owner_user_id"] or user_id in (
                     r["admin_user_ids"].split(",") if r["admin_user_ids"] else []
                 ),
             }
@@ -3740,7 +3740,10 @@ async def list_group_admins(
     return {
         "group_id": group_id,
         "admin_user_ids": admin_ids,
-        "can_remove_admins": current_user_id in admin_ids,
+        "can_remove_admins": (
+            current_user_id == await _db_call(_get_group_owner_id, group_id)
+            or current_user_id in admin_ids
+        ),
     }
 
 
@@ -3772,7 +3775,10 @@ async def remove_group_admin(
     owner_id = await _db_call(_get_group_owner_id, group_id)
     if not owner_id:
         raise HTTPException(status_code=404, detail="group not found")
-    if not await _db_call(_is_group_admin, group_id, current_user_id):
+    creator_removing_other = current_user_id == owner_id and user_id != current_user_id
+    if not creator_removing_other and not await _db_call(
+        _is_group_admin, group_id, current_user_id
+    ):
         raise HTTPException(status_code=403, detail="only group admins can remove admins")
     removed = await _db_call(_remove_group_admin, group_id, user_id)
     if removed == 0:
