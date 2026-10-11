@@ -1506,7 +1506,23 @@ def _build_password_reset_url(token: str) -> str:
     return f"{PUBLIC_APP_URL.rstrip('/')}/reset-password?token={encoded_token}"
 
 
+def _validate_email_configuration() -> None:
+    if EMAIL_TRANSPORT == "sendmail":
+        if not shutil.which(SENDMAIL_PATH):
+            raise RuntimeError(f"Sendmail executable not found at {SENDMAIL_PATH}")
+        return
+    if EMAIL_TRANSPORT != "smtp":
+        raise RuntimeError("EMAIL_TRANSPORT must be one of: sendmail, smtp")
+    if not SMTP_HOST:
+        raise RuntimeError("SMTP_HOST is not set")
+    if SMTP_SECURITY not in {"none", "starttls", "ssl"}:
+        raise RuntimeError("SMTP_SECURITY must be one of: none, starttls, ssl")
+    if bool(SMTP_USERNAME) != bool(SMTP_PASSWORD):
+        raise RuntimeError("SMTP_USER (or SMTP_USERNAME) and SMTP_PASSWORD must be set together")
+
+
 def _send_email(message: EmailMessage) -> None:
+    _validate_email_configuration()
     if EMAIL_TRANSPORT == "sendmail":
         try:
             subprocess.run(
@@ -1527,15 +1543,6 @@ def _send_email(message: EmailMessage) -> None:
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError(f"Sendmail email delivery failed: {exc}") from exc
         return
-
-    if EMAIL_TRANSPORT != "smtp":
-        raise RuntimeError("EMAIL_TRANSPORT must be one of: sendmail, smtp")
-    if not SMTP_HOST:
-        raise RuntimeError("SMTP_HOST is not set")
-    if SMTP_SECURITY not in {"none", "starttls", "ssl"}:
-        raise RuntimeError("SMTP_SECURITY must be one of: none, starttls, ssl")
-    if bool(SMTP_USERNAME) != bool(SMTP_PASSWORD):
-        raise RuntimeError("SMTP_USER (or SMTP_USERNAME) and SMTP_PASSWORD must be set together")
 
     smtp_class = smtplib.SMTP_SSL if SMTP_SECURITY == "ssl" else smtplib.SMTP
     try:
@@ -3186,11 +3193,11 @@ async def register_push_token(
 @app.post("/users", response_model=UserPublic)
 async def create_user(payload: UserCreate):
     email_value = str(payload.email).strip().lower() if payload.email is not None else None
-    if email_value and not SMTP_HOST:
-        raise HTTPException(
-            status_code=503,
-            detail="Email confirmation is not configured on the server",
-        )
+    if email_value:
+        try:
+            _validate_email_configuration()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     submitted_phone = payload.phone_number if payload.phone_number is not None else payload.phone
     phone_value = None
     if submitted_phone is not None:
@@ -3216,12 +3223,15 @@ async def create_user(payload: UserCreate):
             raise HTTPException(status_code=409, detail="email or phone already exists")
         raise
     if email_value:
-        verification_token = await _db_call(_create_email_verification_token, email_value)
         try:
+            verification_token = await _db_call(_create_email_verification_token, email_value)
             await asyncio.to_thread(
                 _send_email_verification_email, email_value, verification_token
             )
         except RuntimeError as exc:
+            # A failed signup must leave the email and phone available for retry.
+            # Delete only the account created by this request; token rows cascade.
+            await _db_call(_delete_user, created_user.id)
             raise HTTPException(status_code=502, detail=str(exc))
     return created_user
 
@@ -3292,11 +3302,10 @@ async def resend_email_verification(payload: ForgotPasswordRequest):
     email = str(payload.email).strip().lower()
     row = await _db_call(_get_user_by_email, email)
     if row and not row["email_verified"]:
-        if not SMTP_HOST:
-            raise HTTPException(
-                status_code=503,
-                detail="Email confirmation is not configured on the server",
-            )
+        try:
+            _validate_email_configuration()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         token = await _db_call(_create_email_verification_token, email)
         if token:
             try:
