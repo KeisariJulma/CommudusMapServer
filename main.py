@@ -2732,6 +2732,31 @@ def _get_message_info(message_id: int) -> Optional[dict]:
         return {"id": row["id"], "group_id": row["group_id"], "user_id": row["user_id"]}
 
 
+def _delete_group_message(group_id: str, message_id: int, user_id: str) -> None:
+    with _get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT user_id, image_path FROM group_messages WHERE id = ? AND group_id = ?",
+            (message_id, group_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="message not found")
+        if row["user_id"] != user_id:
+            raise HTTPException(status_code=403, detail="only sender can delete message")
+        conn.execute(
+            "DELETE FROM group_messages WHERE id = ? AND group_id = ? AND user_id = ?",
+            (message_id, group_id, user_id),
+        )
+        image_path = row["image_path"]
+    if image_path:
+        try:
+            (UPLOAD_DIR / image_path).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print("Failed to delete upload", image_path, exc)
+
+
 def _count_group_members(group_id: str) -> int:
     with _get_conn() as conn:
         row = conn.execute(
@@ -4142,6 +4167,19 @@ async def list_group_messages(
             }
         )
     return enriched
+
+
+@app.delete("/groups/{group_id}/messages/{message_id}", status_code=204)
+async def delete_group_message(
+    group_id: str,
+    message_id: int,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    if not await _db_call(_is_member, group_id, current_user_id):
+        raise HTTPException(status_code=403, detail="not a member of this group")
+    await _db_call(_delete_group_message, group_id, message_id, current_user_id)
 
 
 @app.get("/groups/{group_id}/messages/{message_id}/receipts", response_model=MessageReceiptSummary)
