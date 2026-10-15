@@ -23,6 +23,7 @@ import math
 import secrets
 import re
 import smtplib
+import logging
 import ssl
 import subprocess
 import urllib.request
@@ -37,6 +38,7 @@ from firebase_admin import credentials as firebase_credentials
 from firebase_admin import messaging as firebase_messaging
 
 app = FastAPI()
+logger = logging.getLogger("uvicorn.error")
 DB_PATH = "app.db"
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -1545,15 +1547,24 @@ def _send_email(message: EmailMessage) -> None:
         return
 
     smtp_class = smtplib.SMTP_SSL if SMTP_SECURITY == "ssl" else smtplib.SMTP
+    stage = "connection"
     try:
         tls_options = {"context": ssl.create_default_context()} if SMTP_SECURITY == "ssl" else {}
         with smtp_class(SMTP_HOST, SMTP_PORT, timeout=10, **tls_options) as smtp:
             if SMTP_SECURITY == "starttls":
+                stage = "STARTTLS"
                 smtp.starttls(context=ssl.create_default_context())
             if SMTP_USERNAME:
+                stage = "authentication"
                 smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            stage = "message submission"
             smtp.send_message(message)
+            stage = "connection close"
     except (OSError, smtplib.SMTPException) as exc:
+        logger.error(
+            "SMTP email delivery failed during %s (host=%s, port=%s, security=%s): %s",
+            stage, SMTP_HOST, SMTP_PORT, SMTP_SECURITY, exc,
+        )
         raise RuntimeError(f"SMTP email delivery failed: {exc}") from exc
 
 
