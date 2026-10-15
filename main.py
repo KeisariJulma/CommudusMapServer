@@ -10,6 +10,7 @@ from collections import deque
 import uvicorn
 import time
 import asyncio
+import argparse
 from pathlib import Path
 import sqlite3
 import uuid
@@ -4514,6 +4515,58 @@ async def read_root():
     return Path("src/map.html").read_text()
 
 
+def _command_line(argv=None) -> int:
+    global DB_PATH
+    parser = argparse.ArgumentParser(description="Commudus server and local user administration")
+    commands = parser.add_subparsers(dest="command")
+    listing = commands.add_parser("list-users", help="Show user IDs and account details")
+    deletion = commands.add_parser("delete-user", help="Delete a user by ID")
+    for command in (listing, deletion):
+        command.add_argument("--db", default=DB_PATH, help="Existing database path (default: app.db)")
+    deletion.add_argument("user_id", help="Exact user ID from list-users")
+    deletion.add_argument("--yes", action="store_true", help="Skip deletion confirmation")
+    args = parser.parse_args(argv)
+    if args.command is None:
+        port = int(os.environ.get("PORT", "5656"))
+        uvicorn.run(app, host="0.0.0.0", port=port)
+        return 0
+
+    # Local administration requires filesystem access to the server database.
+    # Do not initialize it here: initialization can create or update admin users.
+    if not Path(args.db).is_file():
+        parser.error(f"Database does not exist: {args.db}")
+    DB_PATH = args.db
+    try:
+        if args.command == "list-users":
+            users = _list_users_for_admin()
+            print("ID\tNAME\tEMAIL\tPHONE\tADMIN\tVERIFIED")
+            for user in users:
+                print("\t".join(str(user[key] if user[key] is not None else "")
+                                .replace("\t", " ").replace("\r", " ").replace("\n", " ")
+                                for key in ("id", "name", "email", "phone", "is_admin", "email_verified")))
+            print(f"{len(users)} user(s)")
+            return 0
+        user = _get_user_by_id(args.user_id)
+        if user is None:
+            print(f"User not found: {args.user_id}")
+            return 1
+        if not args.yes:
+            print(f"Delete {user['name']!r} ({user['email'] or user['phone']}, ID {args.user_id})?")
+            try:
+                confirmed = input("Type DELETE to confirm: ") == "DELETE"
+            except EOFError:
+                confirmed = False
+            if not confirmed:
+                print("Cancelled")
+                return 1
+        if not _delete_user(args.user_id):
+            print(f"User not found: {args.user_id}")
+            return 1
+        print(f"Deleted user: {args.user_id}")
+        return 0
+    except sqlite3.Error as exc:
+        parser.exit(1, f"Database error: {exc}\n")
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5656"))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    raise SystemExit(_command_line())
