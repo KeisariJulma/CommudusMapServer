@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field, ConfigDict, model_validator
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 from collections import deque
 import uvicorn
 import time
@@ -666,6 +666,7 @@ def _init_db() -> None:
             CREATE TABLE IF NOT EXISTS group_members (
               group_id TEXT NOT NULL,
               user_id  TEXT NOT NULL,
+              hunt_role TEXT CHECK(hunt_role IN ('ampuja', 'ajomies')),
               PRIMARY KEY (group_id, user_id),
               FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
               FOREIGN KEY (user_id)  REFERENCES users(id)  ON DELETE CASCADE
@@ -966,6 +967,10 @@ def _init_db() -> None:
         except sqlite3.OperationalError:
             # column already exists
             pass
+
+        member_columns = {row["name"] for row in conn.execute("PRAGMA table_info(group_members)")}
+        if "hunt_role" not in member_columns:
+            conn.execute("ALTER TABLE group_members ADD COLUMN hunt_role TEXT CHECK(hunt_role IN ('ampuja', 'ajomies'))")
 
         line_columns = {row["name"] for row in conn.execute("PRAGMA table_info(group_passi_ajo_lines)")}
         if "color" not in line_columns:
@@ -1332,6 +1337,10 @@ class UserLocation(BaseModel):
     accuracy: Optional[float] = None
     last_seen: float = 0.0
     trail: List[GpsTrailPoint] = Field(default_factory=list)
+
+
+class HuntRoleUpdate(BaseModel):
+    hunt_role: Literal["ampuja", "ajomies"]
 
 
 class GroupCreate(BaseModel):
@@ -2582,7 +2591,7 @@ def _list_members_with_names(group_id: str) -> List[dict]:
     with _get_conn() as conn:
         rows = conn.execute(
             """
-            SELECT u.id AS id, u.name AS name,
+            SELECT u.id AS id, u.name AS name, gm.hunt_role,
                    CASE WHEN ga.user_id IS NOT NULL THEN 'admin'
                         ELSE 'member' END AS role
             FROM group_members gm
@@ -2594,7 +2603,18 @@ def _list_members_with_names(group_id: str) -> List[dict]:
             """,
             (group_id,),
         ).fetchall()
-        return [{"id": r["id"], "name": r["name"], "role": r["role"]} for r in rows]
+        return [{"id": r["id"], "name": r["name"], "role": r["role"],
+                 "hunt_role": r["hunt_role"]} for r in rows]
+
+
+def _set_member_hunt_role(group_id: str, user_id: str, hunt_role: str) -> None:
+    with _get_conn() as conn:
+        updated = conn.execute(
+            "UPDATE group_members SET hunt_role = ? WHERE group_id = ? AND user_id = ?",
+            (hunt_role, group_id, user_id),
+        )
+        if updated.rowcount == 0:
+            raise HTTPException(status_code=403, detail="not a member of this group")
 
 
 def _is_member(group_id: str, user_id: str) -> bool:
@@ -3733,6 +3753,21 @@ async def add_user_to_group(
     if inserted:
         await _notify_group_added(group_id, user_id)
     return {"status": "ok", "group_id": group_id, "user_id": user_id}
+
+
+@app.put("/groups/{group_id}/members/{user_id}/hunt-role")
+async def update_member_hunt_role(
+    group_id: str,
+    user_id: str,
+    payload: HuntRoleUpdate,
+    current_user_id: str = Depends(get_current_user_id),
+):
+    if user_id != current_user_id:
+        raise HTTPException(status_code=403, detail="can only update your own hunting role")
+    if not await _db_call(_group_exists, group_id):
+        raise HTTPException(status_code=404, detail="group not found")
+    await _db_call(_set_member_hunt_role, group_id, current_user_id, payload.hunt_role)
+    return {"hunt_role": payload.hunt_role}
 
 
 @app.delete("/groups/{group_id}/members/{user_id}")
